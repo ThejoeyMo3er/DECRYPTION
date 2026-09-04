@@ -31,14 +31,14 @@ from telegram.ext import (
 )
 
 # ============================================================
-# Star Decryptor - single-file Telegram bot | v1.5.0
+# ProDecryptor - single-file Telegram bot | v1.5.0
 # ============================================================
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.9.0"
 APP_NAME = "Star Decryptor"
-RELEASE = "1.6.0"
+RELEASE = "1.9.0"
 BUILD_DATE = "2026-09-04"
-RELEASE_NOTES = "1.6.0 — migrated from Pantegnos to DECRYPTION_SCRIPTS backend"
+RELEASE_NOTES = "1.5.0 — source-first profile reconstruction, exact transport preservation, clean result UI, password retry, no engine artifacts"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = 5728292317
@@ -46,9 +46,8 @@ ADMIN_ID = 5728292317
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DB_PATH = DATA_DIR / "prodecryptor.db"
 
-DECRYPTION_SCRIPTS_DIR = os.getenv("DECRYPTION_SCRIPTS_DIR", "/opt/DECRYPTION_SCRIPTS")
-DECRYPTION_RUNNER = os.getenv("DECRYPTION_RUNNER", "")
-PANTEGNOS_BIN = os.getenv("DECRYPTION_BIN", DECRYPTION_RUNNER)
+DECRYPTION_SCRIPTS_DIR = Path(os.getenv("DECRYPTION_SCRIPTS_DIR", "/opt/DECRYPTION_SCRIPTS"))
+PANTEGNOS_BIN = ""
 
 DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
 DEFAULT_PROCESS_TIMEOUT = 90
@@ -232,7 +231,7 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
         CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
         """)
-        # Safe migrations for databases created by older Star Decryptor versions.
+        # Safe migrations for databases created by older ProDecryptor versions.
         for col, ddl in (
             ("captcha_verified", "ALTER TABLE users ADD COLUMN captcha_verified INTEGER DEFAULT 0"),
             ("captcha_ops", "ALTER TABLE users ADD COLUMN captcha_ops INTEGER DEFAULT 0"),
@@ -713,7 +712,7 @@ def _csv_list(value):
 
 def _xray_base(remark, outbound):
     return {
-        "remarks": _clean_remark(remark) or "Star Decryptor",
+        "remarks": _clean_remark(remark) or "ProDecryptor",
         "log": {"loglevel": "warning"},
         "inbounds": [{"tag": "socks", "port": 10808, "protocol": "socks", "settings": {"auth": "noauth", "udp": True, "userLevel": 8}, "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}}],
         "outbounds": [outbound,
@@ -1215,7 +1214,7 @@ async def start(update, context):
 
     limit = int(DB.setting("daily_limit", "5"))
     await update.message.reply_text(
-        "✨ <b>Star Decryptor</b> <code>v" + APP_VERSION + "</code>\n\n"
+        "✨ <b>ProDecryptor</b> <code>v" + APP_VERSION + "</code>\n\n"
         "فایل کانفیگ یا لینک خودت را ارسال کن.\n\n"
         f"📅 سهمیه امروز: <b>{'∞' if limit == 0 else limit}</b> فایل",
         parse_mode=ParseMode.HTML,
@@ -1230,7 +1229,7 @@ async def help_command(update, context):
         if not await require_join(update, context): return
         if not await ask_captcha(update, context): return
     await update.message.reply_text(
-        "ℹ️ <b>راهنمای کامل و ساده Star Decryptor</b>\n\n"
+        "ℹ️ <b>راهنمای کامل و ساده ProDecryptor</b>\n\n"
         "📤 <b>ارسال فایل</b>\nبرای فایل‌های واقعی کانفیگ استفاده کن: <code>SLIP</code>، <code>EHI</code>، <code>DARK</code>، <code>HAT</code>، <code>NPVT</code>، <code>NPVS</code>، <code>NM</code> و <code>HAPP</code>.\n\n"
         "🔗 <b>ارسال لینک/متن</b>\nبرای وقتی است که لینک یا کلید را به‌صورت متن داری؛ بات موارد قابل شناسایی را جدا می‌کند.\n\n"
         "🌐 <b>موارد قابل شناسایی</b>\nVLESS، VMess، Trojan، Shadowsocks، SOCKS، Hysteria، Hysteria2، TUIC، WireGuard و SSH.\n\n"
@@ -1429,11 +1428,7 @@ async def run_engine(input_dir, output_dir, password=None):
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     timeout = max(10, int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT))))
-    if not PANTEGNOS_BIN:
-        # DECRYPTION_SCRIPTS projects are script based. Configure runner in compose.
-        # Example: python /opt/DECRYPTION_SCRIPTS/decrypt.py
-        raise FileNotFoundError("DECRYPTION_RUNNER is not configured")
-    command = PANTEGNOS_BIN.split() + [str(input_dir), str(output_dir)]
+    command = [PANTEGNOS_BIN, "-input", str(input_dir), "-output", str(output_dir)]
     job_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     log.info("engine start input=%s output=%s interactive_password=%s", input_dir, output_dir, bool(password))
     async with JOB_SEMAPHORE:
@@ -1635,7 +1630,7 @@ async def handle_document(update, context):
             path.unlink(missing_ok=True)
 
     if ext not in SUPPORTED_EXTENSIONS:
-        await update.message.reply_text("⚠️ این پسوند در موتور فعلی Star Decryptor ثبت نشده است.")
+        await update.message.reply_text("⚠️ این پسوند در موتور فعلی ProDecryptor ثبت نشده است.")
         return
     if not app_format_enabled(ext):
         await update.message.reply_text(f"⛔ فرمت {esc(app_format_label(ext))} فعلاً توسط مدیر غیرفعال شده است.", parse_mode=ParseMode.HTML)
@@ -1811,7 +1806,7 @@ async def admin_command(update, context):
         return
     DB.upsert_user(update.effective_user)
     await update.message.reply_text(
-        "🛡 <b>Star Decryptor Admin</b> <code>v" + APP_VERSION + "</code>",
+        "🛡 <b>ProDecryptor Admin</b> <code>v" + APP_VERSION + "</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_menu(),
     )
@@ -2155,7 +2150,7 @@ async def admin_status(q):
     engine = os.path.isfile(PANTEGNOS_BIN)
     await q.message.edit_text(
         "🛠 <b>وضعیت سرویس</b>\n\n"
-        f"🤖 Star Decryptor: <b>v{APP_VERSION}</b>\n"
+        f"🤖 ProDecryptor: <b>v{APP_VERSION}</b>\n"
         f"⚙️ موتور پردازش: <b>{'آماده' if engine else 'یافت نشد'}</b>\n"
         f"💾 دیتابیس: <code>{esc(DB_PATH)}</code>\n"
         f"📦 حجم: <b>{file_size_text(int(DB.setting('max_file_size', str(DEFAULT_MAX_FILE_SIZE))) )}</b>\n"
@@ -2597,3 +2592,40 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ================= Star Decryptor Engine Adapter v1.9.0 =================
+# Replaces Pantegnos execution with DECRYPTION_SCRIPTS plugin loading.
+
+import importlib.util
+
+STAR_FORMAT_MAP = {
+    ".npvt": "NPVT.py",
+    ".npvs": "NPVS.py",
+    ".ehi": "EHI.py",
+    ".hat": "HAT.py",
+    ".dark": "DARK.py",
+    ".hc": "HC.py",
+    ".nm": "NM.py",
+}
+
+def star_load_plugin(ext):
+    name = STAR_FORMAT_MAP.get(ext.lower())
+    if not name:
+        return None
+    for p in DECRYPTION_SCRIPTS_DIR.rglob(name):
+        spec=importlib.util.spec_from_file_location("star_plugin", p)
+        if spec and spec.loader:
+            m=importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            return m
+    return None
+
+def star_decrypt(file_name, raw):
+    plugin=star_load_plugin(Path(file_name).suffix)
+    if not plugin:
+        return {"status":"unsupported","format":Path(file_name).suffix}
+    if hasattr(plugin,"run"):
+        return plugin.run(raw)
+    return {"status":"error","message":"plugin has no run()"}
+# ========================================================================
