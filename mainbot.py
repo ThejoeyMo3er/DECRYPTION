@@ -1,1095 +1,2599 @@
-from __future__ import annotations
-import asyncio, base64, contextlib, dataclasses, gzip, hashlib, html, io, json, logging, os, pickle, re, secrets, shutil, sqlite3, struct, tempfile, time, uuid
-from dataclasses import dataclass, field
+import asyncio
+import base64
+from collections import deque
+import random
+import secrets
+import threading
+import html
+import json
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from urllib.parse import urlencode, quote
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
-from Crypto.Cipher import AES, ChaCha20, ChaCha20_Poly1305
-from Crypto.Util.Padding import unpad
-from argon2.low_level import hash_secret_raw, Type
-import msgpack
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# ===== database.py =====
-import sqlite3, time
-from pathlib import Path
+# ============================================================
+# Star Decryptor - single-file Telegram bot | v1.5.0
+# ============================================================
 
-DEFAULTS = {
-    "daily_limit":"5", "maintenance":"0", "max_file_size":str(50*1024*1024),
-    "process_timeout":"90", "max_configs":"100", "concurrency":"4",
-    "duplicate_filter":"1", "validation":"1", "logging_level":"INFO",
-    "output_uri":"1", "output_json":"1", "output_original":"1",
-    "captcha_interval":"10", "captcha_max_attempts":"5",
-    "admin_ids":"5728292317",
+APP_VERSION = "1.6.0"
+APP_NAME = "Star Decryptor"
+RELEASE = "1.6.0"
+BUILD_DATE = "2026-09-04"
+RELEASE_NOTES = "1.6.0 — migrated from Pantegnos to DECRYPTION_SCRIPTS backend"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = 5728292317
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+DB_PATH = DATA_DIR / "prodecryptor.db"
+
+DECRYPTION_SCRIPTS_DIR = os.getenv("DECRYPTION_SCRIPTS_DIR", "/opt/DECRYPTION_SCRIPTS")
+DECRYPTION_RUNNER = os.getenv("DECRYPTION_RUNNER", "")
+PANTEGNOS_BIN = os.getenv("DECRYPTION_BIN", DECRYPTION_RUNNER)
+
+DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
+DEFAULT_PROCESS_TIMEOUT = 90
+MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "4")))
+TELEGRAM_CHUNK = 3900
+LOG_WINDOW_SECONDS = 300
+ENGINE_LOG_PATH = DATA_DIR / "engine.log"
+
+def reset_engine_log():
+    """Start every bot process with a fresh engine log on persistent storage."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        ENGINE_LOG_PATH.write_text("", encoding="utf-8")
+    except Exception:
+        pass
+
+# App-format feature registry. These switches control INPUT APP FILES only.
+# Output protocols (VLESS/VMess/Trojan/SS/...) are intentionally separate and are
+# never used to decide whether an app file such as .npvt or .ehi is accepted.
+APP_FORMATS = {
+    ".npvt": {"name": "NPVT", "setting": "app_npvt"},
+    ".npvs": {"name": "NPVS", "setting": "app_npvs"},
+    ".slip": {"name": "SLIP", "setting": "app_slip"},
+    ".dark": {"name": "DarkTunnel", "setting": "app_dark"},
+    ".ehi": {"name": "HTTP Injector", "setting": "app_ehi"},
+    ".hat": {"name": "HA Tunnel Plus", "setting": "app_hat"},
+    ".nm": {"name": "NetMod VPN", "setting": "app_nm"},
+    ".happ": {"name": "HAPP", "setting": "app_happ"},
 }
-FORMATS = {
-    "ehi":"HTTP Injector", "npvt":"NPV Tunnel", "hc":"HTTP Custom",
-    "dark":"Dark Tunnel", "ssc":"SSC Custom",
+SUPPORTED_EXTENSIONS = set(APP_FORMATS)
+
+# Per-app output feature matrix.  Every result capability is independently
+# switchable for every input format. Disabled capabilities are removed from
+# the result keyboard and are also rejected server-side in callbacks.
+RESULT_FEATURES = {
+    "links": "🔗 لینک‌های کانفیگ",
+    "json": "📋 JSON استاندارد Xray",
+    "keys": "🔑 کلیدها",
+    "info": "🔍 اطلاعات پردازش",
+    "original": "📄 فایل اصلی با فرمت اصلی",
 }
-FEATURES = ("decrypt","uri","json","original")
+
+def feature_setting_key(ext, feature):
+    return f"feature_{str(ext).lower().lstrip('.')}__{feature}"
+
+def feature_enabled(ext, feature):
+    if feature not in RESULT_FEATURES:
+        return False
+    return DB.setting(feature_setting_key(ext, feature), "1") == "1"
+
+def enabled_features(ext):
+    return [f for f in RESULT_FEATURES if feature_enabled(ext, f)]
+
+
+# Output protocols are only for parsing genuine URI outputs.  UUIDs, IPs,
+# hostnames, server names and arbitrary text are never promoted to links.
+OUTPUT_PROTOCOLS = {
+    "vless", "vmess", "trojan", "ss", "socks", "socks5",
+    "hysteria", "hysteria2", "hy2", "tuic", "wireguard", "ssh",
+}
+URI_SCHEMES = tuple(f"{p}://" for p in sorted(OUTPUT_PROTOCOLS, key=len, reverse=True))
+URL_RE = re.compile(
+    r"(?i)(?:vless|vmess|trojan|ss|socks5?|hysteria2?|hy2|tuic|wireguard|ssh)://[^\s<>\[\]{}\"']+"
+)
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("prodecryptor")
+
+class FiveMinuteHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            item = (time.time(), self.format(record))
+            with LOG_LOCK:
+                LOG_BUFFER.append(item)
+                cutoff = time.time() - LOG_WINDOW_SECONDS
+                while LOG_BUFFER and LOG_BUFFER[0][0] < cutoff:
+                    LOG_BUFFER.popleft()
+        except Exception:
+            pass
+
+_log_buffer_handler = FiveMinuteHandler()
+_log_buffer_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+logging.getLogger().addHandler(_log_buffer_handler)
+
+JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+USER_JOBS = {}
+ADMIN_STATE = {}
+CAPTCHA_PENDING = {}
+LOG_BUFFER = deque()
+LOG_LOCK = threading.Lock()
+
+
+# ============================================================
+# Database
+# ============================================================
 
 class Database:
-    def __init__(self, path: Path): self.path=Path(path); self.conn=None
+    def __init__(self, path):
+        self.path = path
+        self.conn = None
+
     def open(self):
-        self.path.parent.mkdir(parents=True,exist_ok=True)
-        self.conn=sqlite3.connect(self.path,check_same_thread=False,timeout=30)
-        self.conn.row_factory=sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL"); self.conn.execute("PRAGMA synchronous=NORMAL"); self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript('''
-        CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT DEFAULT '',first_name TEXT DEFAULT '',last_name TEXT DEFAULT '',is_blocked INTEGER DEFAULT 0,first_seen INTEGER NOT NULL,last_seen INTEGER NOT NULL,total_files INTEGER DEFAULT 0,successful_files INTEGER DEFAULT 0,failed_files INTEGER DEFAULT 0,total_links INTEGER DEFAULT 0,captcha_verified INTEGER DEFAULT 0,captcha_ops INTEGER DEFAULT 0,captcha_failures INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS force_join_channels(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id TEXT NOT NULL UNIQUE,title TEXT NOT NULL DEFAULT '',username TEXT DEFAULT '',invite_url TEXT DEFAULT '',active INTEGER DEFAULT 1,created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS daily_usage(user_id INTEGER NOT NULL,day TEXT NOT NULL,count INTEGER DEFAULT 0,PRIMARY KEY(user_id,day),FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE);
-        CREATE TABLE IF NOT EXISTS sponsors(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,url TEXT NOT NULL,button_text TEXT NOT NULL,style TEXT NOT NULL DEFAULT 'primary',active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,filename TEXT NOT NULL,extension TEXT NOT NULL,status TEXT NOT NULL,links_count INTEGER DEFAULT 0,error TEXT DEFAULT '',created_at INTEGER NOT NULL,finished_at INTEGER DEFAULT 0);
-        CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen); CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
-        ''')
-        for col, ddl in (("captcha_verified","ALTER TABLE users ADD COLUMN captcha_verified INTEGER DEFAULT 0"),("captcha_ops","ALTER TABLE users ADD COLUMN captcha_ops INTEGER DEFAULT 0"),("captcha_failures","ALTER TABLE users ADD COLUMN captcha_failures INTEGER DEFAULT 0")):
-            try:self.conn.execute(ddl)
-            except sqlite3.OperationalError:pass
-        for k,v in DEFAULTS.items(): self.conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
-        legacy = {'ehi':'app_ehi','npvt':'app_npvt','hc':None,'dark':'app_dark','ssc':None}
-        for fmt in FORMATS:
-            legacy_key=legacy.get(fmt)
-            legacy_val=self.get(legacy_key,'1') if legacy_key else '1'
-            self.conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(f"format_{fmt}",legacy_val))
-            for f in FEATURES:
-                old={'uri':'links','json':'json','original':'original'}.get(f)
-                old_key=f"feature_{fmt}__{old}" if old else None
-                val=self.get(old_key,'1') if old_key else '1'
-                self.conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(f"format_{fmt}_{f}",val))
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.init_schema()
+        self.seed()
 
-            for f in FEATURES: self.conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(f"format_{fmt}_{f}","1"))
+    def init_schema(self):
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            last_name TEXT DEFAULT '',
+            is_blocked INTEGER DEFAULT 0,
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            total_files INTEGER DEFAULT 0,
+            successful_files INTEGER DEFAULT 0,
+            failed_files INTEGER DEFAULT 0,
+            total_links INTEGER DEFAULT 0,
+            captcha_verified INTEGER DEFAULT 0,
+            captcha_ops INTEGER DEFAULT 0,
+            captcha_failures INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS force_join_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL DEFAULT '',
+            username TEXT DEFAULT '',
+            invite_url TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, day),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS sponsors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            button_text TEXT NOT NULL,
+            style TEXT NOT NULL DEFAULT 'primary',
+            active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            extension TEXT NOT NULL,
+            status TEXT NOT NULL,
+            links_count INTEGER DEFAULT 0,
+            error TEXT DEFAULT '',
+            created_at INTEGER NOT NULL,
+            finished_at INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
+        """)
+        # Safe migrations for databases created by older Star Decryptor versions.
+        for col, ddl in (
+            ("captcha_verified", "ALTER TABLE users ADD COLUMN captcha_verified INTEGER DEFAULT 0"),
+            ("captcha_ops", "ALTER TABLE users ADD COLUMN captcha_ops INTEGER DEFAULT 0"),
+            ("captcha_failures", "ALTER TABLE users ADD COLUMN captcha_failures INTEGER DEFAULT 0"),
+        ):
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         self.conn.commit()
-    def get(self,k,d=""): return (self.conn.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone() or {"value":d})["value"]
-    def set(self,k,v): self.conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,str(v))); self.conn.commit()
-    def fmt_enabled(self,fmt): return self.get(f"format_{fmt}","0")=="1"
-    def feature_enabled(self,fmt,f):
-        if f=="decrypt": return self.fmt_enabled(fmt) and self.get(f"format_{fmt}_decrypt","0")=="1"
-        if f=="uri": return self.fmt_enabled(fmt) and self.get("output_uri","0")=="1" and self.get(f"format_{fmt}_uri","0")=="1"
-        if f=="json": return self.fmt_enabled(fmt) and self.get("output_json","0")=="1" and self.get(f"format_{fmt}_json","0")=="1"
-        if f=="original": return self.fmt_enabled(fmt) and self.get("output_original","0")=="1" and self.get(f"format_{fmt}_original","0")=="1"
-        return False
-    def upsert_user(self,u):
-        now=int(time.time()); self.conn.execute('''INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,first_name=excluded.first_name,last_name=excluded.last_name,last_seen=excluded.last_seen''',(u.id,u.username or '',u.first_name or '',u.last_name or '',now,now)); self.conn.commit()
-    def user(self,uid): return self.conn.execute("SELECT * FROM users WHERE user_id=?",(uid,)).fetchone()
-    def daily_usage(self,uid):
-        day=time.strftime('%Y-%m-%d',time.gmtime()); r=self.conn.execute("SELECT count FROM daily_usage WHERE user_id=? AND day=?",(uid,day)).fetchone(); return int(r[0]) if r else 0
-    def consume(self,uid):
-        limit=int(self.get('daily_limit','5')); day=time.strftime('%Y-%m-%d',time.gmtime()); cur=self.daily_usage(uid)
-        if limit and cur>=limit:return False
-        self.conn.execute("INSERT INTO daily_usage(user_id,day,count) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET count=count+1",(uid,day)); self.conn.execute("UPDATE users SET total_files=total_files+1 WHERE user_id=?",(uid,)); self.conn.commit(); return True
-    def refund(self,uid):
-        day=time.strftime('%Y-%m-%d',time.gmtime()); self.conn.execute("UPDATE daily_usage SET count=CASE WHEN count>0 THEN count-1 ELSE 0 END WHERE user_id=? AND day=?",(uid,day)); self.conn.execute("UPDATE users SET total_files=CASE WHEN total_files>0 THEN total_files-1 ELSE 0 END WHERE user_id=?",(uid,)); self.conn.commit()
-    def success(self,uid,n): self.conn.execute("UPDATE users SET successful_files=successful_files+1,total_links=total_links+? WHERE user_id=?",(n,uid)); self.conn.commit()
-    def failure(self,uid): self.conn.execute("UPDATE users SET failed_files=failed_files+1 WHERE user_id=?",(uid,)); self.conn.commit()
-    def job(self,jid,uid,fn,ext): self.conn.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?)",(jid,uid,fn,ext,'processing',0,'',int(time.time()),0)); self.conn.commit()
-    def finish(self,jid,status,n=0,error=''): self.conn.execute("UPDATE jobs SET status=?,links_count=?,error=?,finished_at=? WHERE id=?",(status,n,str(error)[:2000],int(time.time()),jid)); self.conn.commit()
+
+    def seed(self):
+        defaults = {
+            "daily_limit": "5",       # 0 = unlimited
+            "maintenance": "0",
+            "max_file_size": str(DEFAULT_MAX_FILE_SIZE),
+            "process_timeout": str(DEFAULT_PROCESS_TIMEOUT),
+            "captcha_interval": "10",
+            "captcha_max_attempts": "5",
+            "app_npvt": "1",
+            "app_npvs": "1",
+            "app_slip": "1",
+            "app_dark": "1",
+            "app_ehi": "1",
+            "app_hat": "1",
+            "app_nm": "1",
+            "app_happ": "1",
+            "feature_npvt__links": "1",
+            "feature_npvt__json": "1",
+            "feature_npvt__keys": "1",
+            "feature_npvt__info": "1",
+            "feature_npvt__original": "1",
+            "feature_npvs__links": "1",
+            "feature_npvs__json": "1",
+            "feature_npvs__keys": "1",
+            "feature_npvs__info": "1",
+            "feature_npvs__original": "1",
+            "feature_slip__links": "1",
+            "feature_slip__json": "1",
+            "feature_slip__keys": "1",
+            "feature_slip__info": "1",
+            "feature_slip__original": "1",
+            "feature_dark__links": "1",
+            "feature_dark__json": "1",
+            "feature_dark__keys": "1",
+            "feature_dark__info": "1",
+            "feature_dark__original": "1",
+            "feature_ehi__links": "1",
+            "feature_ehi__json": "1",
+            "feature_ehi__keys": "1",
+            "feature_ehi__info": "1",
+            "feature_ehi__original": "1",
+            "feature_hat__links": "1",
+            "feature_hat__json": "1",
+            "feature_hat__keys": "1",
+            "feature_hat__info": "1",
+            "feature_hat__original": "1",
+            "feature_nm__links": "1",
+            "feature_nm__json": "1",
+            "feature_nm__keys": "1",
+            "feature_nm__info": "1",
+            "feature_nm__original": "1",
+            "feature_happ__links": "1",
+            "feature_happ__json": "1",
+            "feature_happ__keys": "1",
+            "feature_happ__info": "1",
+            "feature_happ__original": "1",
+        }
+        for k, v in defaults.items():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v)
+            )
+        self.conn.commit()
+
+    def setting(self, key, default=""):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key, value):
+        self.conn.execute(
+            "INSERT INTO settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def upsert_user(self, user):
+        now = int(time.time())
+        self.conn.execute(
+            """
+            INSERT INTO users(user_id,username,first_name,last_name,first_seen,last_seen)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              username=excluded.username,
+              first_name=excluded.first_name,
+              last_name=excluded.last_name,
+              last_seen=excluded.last_seen
+            """,
+            (
+                user.id, user.username or "", user.first_name or "",
+                user.last_name or "", now, now,
+            ),
+        )
+        self.conn.commit()
+
+    def get_user(self, user_id):
+        return self.conn.execute(
+            "SELECT * FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+
+    def set_blocked(self, user_id, blocked):
+        self.conn.execute(
+            "UPDATE users SET is_blocked=? WHERE user_id=?",
+            (1 if blocked else 0, user_id),
+        )
+        self.conn.commit()
+
+    def daily_usage(self, user_id):
+        row = self.conn.execute(
+            "SELECT count FROM daily_usage WHERE user_id=? AND day=?",
+            (user_id, utc_day()),
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def consume_daily(self, user_id):
+        limit = int(self.setting("daily_limit", "5"))
+        if limit == 0:
+            self.conn.execute(
+                "UPDATE users SET total_files=total_files+1 WHERE user_id=?",
+                (user_id,),
+            )
+            self.conn.commit()
+            return True
+
+        day = utc_day()
+        row = self.conn.execute(
+            "SELECT count FROM daily_usage WHERE user_id=? AND day=?",
+            (user_id, day),
+        ).fetchone()
+        current = int(row["count"]) if row else 0
+        if current >= limit:
+            return False
+
+        if row:
+            self.conn.execute(
+                "UPDATE daily_usage SET count=count+1 WHERE user_id=? AND day=?",
+                (user_id, day),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO daily_usage(user_id,day,count) VALUES(?,?,1)",
+                (user_id, day),
+            )
+
+        self.conn.execute(
+            "UPDATE users SET total_files=total_files+1 WHERE user_id=?",
+            (user_id,),
+        )
+        self.conn.commit()
+        return True
+
+    def refund_daily(self, user_id):
+        limit = int(self.setting("daily_limit", "5"))
+        if limit == 0:
+            self.conn.execute(
+                "UPDATE users SET total_files=CASE WHEN total_files>0 THEN total_files-1 ELSE 0 END WHERE user_id=?",
+                (user_id,),
+            )
+            self.conn.commit()
+            return
+
+        day = utc_day()
+        self.conn.execute(
+            "UPDATE daily_usage SET count=CASE WHEN count>0 THEN count-1 ELSE 0 END "
+            "WHERE user_id=? AND day=?",
+            (user_id, day),
+        )
+        self.conn.execute(
+            "UPDATE users SET total_files=CASE WHEN total_files>0 THEN total_files-1 ELSE 0 END "
+            "WHERE user_id=?",
+            (user_id,),
+        )
+        self.conn.commit()
+
+    def record_success(self, user_id, links):
+        self.conn.execute(
+            "UPDATE users SET successful_files=successful_files+1,total_links=total_links+? WHERE user_id=?",
+            (links, user_id),
+        )
+        self.conn.commit()
+
+    def record_failure(self, user_id):
+        self.conn.execute(
+            "UPDATE users SET failed_files=failed_files+1 WHERE user_id=?",
+            (user_id,),
+        )
+        self.conn.commit()
+
+    def create_job(self, job_id, user_id, filename, extension):
+        self.conn.execute(
+            "INSERT INTO jobs(id,user_id,filename,extension,status,created_at) VALUES(?,?,?,?,?,?)",
+            (job_id, user_id, filename, extension, "processing", int(time.time())),
+        )
+        self.conn.commit()
+
+    def finish_job(self, job_id, status, links=0, error=""):
+        self.conn.execute(
+            "UPDATE jobs SET status=?,links_count=?,error=?,finished_at=? WHERE id=?",
+            (status, links, error[:2000], int(time.time()), job_id),
+        )
+        self.conn.commit()
+
+    def sponsors(self, active_only=True):
+        if active_only:
+            return self.conn.execute(
+                "SELECT * FROM sponsors WHERE active=1 ORDER BY sort_order,id"
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM sponsors ORDER BY sort_order,id"
+        ).fetchall()
+
+    def sponsor(self, sponsor_id):
+        return self.conn.execute(
+            "SELECT * FROM sponsors WHERE id=?", (sponsor_id,)
+        ).fetchone()
+
+    def add_sponsor(self, name, url, button_text, style, active=True):
+        now = int(time.time())
+        order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM sponsors"
+        ).fetchone()["n"]
+        cur = self.conn.execute(
+            """
+            INSERT INTO sponsors(name,url,button_text,style,active,sort_order,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (name, url, button_text, style, 1 if active else 0, int(order), now, now),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_sponsor(self, sponsor_id, name, url, button_text, style):
+        self.conn.execute(
+            """
+            UPDATE sponsors
+            SET name=?,url=?,button_text=?,style=?,updated_at=?
+            WHERE id=?
+            """,
+            (name, url, button_text, style, int(time.time()), sponsor_id),
+        )
+        self.conn.commit()
+
+    def set_sponsor_active(self, sponsor_id, active):
+        self.conn.execute(
+            "UPDATE sponsors SET active=?,updated_at=? WHERE id=?",
+            (1 if active else 0, int(time.time()), sponsor_id),
+        )
+        self.conn.commit()
+
+    def delete_sponsor(self, sponsor_id):
+        self.conn.execute("DELETE FROM sponsors WHERE id=?", (sponsor_id,))
+        self.conn.commit()
+
     def stats(self):
-        u=self.conn.execute("SELECT COUNT(*) n,COALESCE(SUM(total_files),0) f,COALESCE(SUM(successful_files),0) s,COALESCE(SUM(failed_files),0) e,COALESCE(SUM(total_links),0) l FROM users").fetchone(); return dict(users=u['n'],files=u['f'],success=u['s'],failed=u['e'],uris=u['l'],jobs24=self.conn.execute("SELECT COUNT(*) FROM jobs WHERE created_at>=?",(int(time.time())-86400,)).fetchone()[0])
+        total_users = self.conn.execute(
+            "SELECT COUNT(*) n FROM users"
+        ).fetchone()["n"]
+        active_24h = self.conn.execute(
+            "SELECT COUNT(*) n FROM users WHERE last_seen>=?",
+            (int(time.time()) - 86400,),
+        ).fetchone()["n"]
+        blocked = self.conn.execute(
+            "SELECT COUNT(*) n FROM users WHERE is_blocked=1"
+        ).fetchone()["n"]
+        totals = self.conn.execute(
+            "SELECT COALESCE(SUM(total_files),0) files,"
+            "COALESCE(SUM(successful_files),0) success,"
+            "COALESCE(SUM(failed_files),0) failed,"
+            "COALESCE(SUM(total_links),0) links FROM users"
+        ).fetchone()
+        jobs24 = self.conn.execute(
+            "SELECT COUNT(*) n FROM jobs WHERE created_at>=?",
+            (int(time.time()) - 86400,),
+        ).fetchone()["n"]
+        return {
+            "users": int(total_users),
+            "active": int(active_24h),
+            "blocked": int(blocked),
+            "files": int(totals["files"]),
+            "success": int(totals["success"]),
+            "failed": int(totals["failed"]),
+            "links": int(totals["links"]),
+            "jobs24": int(jobs24),
+        }
+
+    def users_page(self, page, per_page=8):
+        return self.conn.execute(
+            "SELECT * FROM users ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+            (per_page, page * per_page),
+        ).fetchall()
+
+    def user_count(self):
+        return int(self.conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"])
+
+    def recent_jobs(self, limit=15):
+        return self.conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def set_captcha_verified(self, user_id, verified=True):
+        self.conn.execute("UPDATE users SET captcha_verified=?, captcha_ops=0, captcha_failures=0 WHERE user_id=?", (1 if verified else 0, user_id))
+        self.conn.commit()
+
+    def captcha_state(self, user_id):
+        row = self.get_user(user_id)
+        if not row:
+            return False, 0, 0
+        return bool(row["captcha_verified"]), int(row["captcha_ops"]), int(row["captcha_failures"])
+
+    def captcha_increment_ops(self, user_id):
+        self.conn.execute("UPDATE users SET captcha_ops=captcha_ops+1 WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def captcha_fail(self, user_id):
+        self.conn.execute("UPDATE users SET captcha_failures=captcha_failures+1 WHERE user_id=?", (user_id,))
+        self.conn.commit()
+        return int(self.get_user(user_id)["captcha_failures"])
+
+    def reset_captcha_failures(self, user_id):
+        self.conn.execute("UPDATE users SET captcha_failures=0 WHERE user_id=?", (user_id,))
+        self.conn.commit()
+
+    def channels(self, active_only=True):
+        sql = "SELECT * FROM force_join_channels" + (" WHERE active=1" if active_only else "") + " ORDER BY id"
+        return self.conn.execute(sql).fetchall()
+
+    def add_channel(self, chat_id, title, username, invite_url):
+        cur = self.conn.execute(
+            "INSERT OR REPLACE INTO force_join_channels(chat_id,title,username,invite_url,active,created_at) VALUES(?,?,?,?,1,?)",
+            (str(chat_id), title or "", username or "", invite_url or "", int(time.time())),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def channel(self, cid):
+        return self.conn.execute("SELECT * FROM force_join_channels WHERE id=?", (cid,)).fetchone()
+
+    def toggle_channel(self, cid):
+        self.conn.execute("UPDATE force_join_channels SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (cid,))
+        self.conn.commit()
+
+    def delete_channel(self, cid):
+        self.conn.execute("DELETE FROM force_join_channels WHERE id=?", (cid,))
+        self.conn.commit()
+
+    def snapshot(self, destination):
+        destination = str(destination)
+        dest = sqlite3.connect(destination)
+        try:
+            with self.conn:
+                self.conn.backup(dest)
+        finally:
+            dest.close()
+
     def close(self):
-        if self.conn:self.conn.close()
+        if self.conn:
+            self.conn.close()
 
 
-# ===== models.py =====
-from dataclasses import dataclass, field
-from typing import Any
-
-@dataclass
-class ParsedConfig:
-    format_name: str
-    data: Any
-    source_name: str
-    decrypted: bool = True
-    warnings: list[str] = field(default_factory=list)
-
-@dataclass
-class NormalizedConfig:
-    protocol: str
-    address: str
-    port: int
-    uuid: str | None = None
-    password: str | None = None
-    remark: str | None = None
-    network: str | None = None
-    security: str | None = None
-    path: str | None = None
-    host: str | None = None
-    sni: str | None = None
-    alpn: list[str] = field(default_factory=list)
-    fingerprint: str | None = None
-    flow: str | None = None
-    extra: dict[str, Any] = field(default_factory=dict)
+DB = Database(DB_PATH)
 
 
-# ===== detector.py =====
-from dataclasses import dataclass
-import json,re
+# ============================================================
+# Helpers
+# ============================================================
 
-@dataclass(frozen=True)
-class FormatMatch:
-    key:str; confidence:str; reason:str
+def utc_day():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-def detect(data:bytes, filename:str='') -> FormatMatch|None:
-    name=filename.lower()
-    if data.startswith((b'NPVT1',b'NPVTSUB1')):
-        return FormatMatch('npvt','signature','NPVT1/NPVTSUB1 header')
-    if name.endswith('.ehi') or _looks_ehi(data): return FormatMatch('ehi','strong','EHI binary container')
-    if name.endswith('.hc') or _looks_hc(data): return FormatMatch('hc','strong','HC XOR/hex envelope')
-    if name.endswith('.dark') or _looks_dark(data): return FormatMatch('dark','strong','Dark Tunnel outer JSON/base64 envelope')
-    if _looks_ssc(data,name): return FormatMatch('ssc','strong','SSC hex/ssc envelope')
+
+def now_text():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def esc(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+def mdv2(value):
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!])", r"\\\1", value)
+
+
+def normalize_link(link):
+    value = str(link or "").strip()
+    # Do not strip URL-safe closing chars blindly; only remove obvious prose
+    # punctuation that cannot be part of these URI outputs.
+    return value.rstrip(".,;)]}>'\"")
+
+
+KEY_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:[#>*`\-_/]+\s*)?(?:key|app\s*key|appkey|config\s*key|configkey|access\s*key|accesskey|subscription\s*key|pass\s*key|passkey)\s*[:=\-]\s*([^\r\n`<>]+?)\s*$"
+)
+JSON_KEY_RE = re.compile(
+    r"(?i)[\"'](?:appKey|configKey|accessKey|subscriptionKey|passKey|passkey|key)[\"']\s*[:=]\s*[\"']([^\"']+)[\"']"
+)
+
+
+def app_format_enabled(ext):
+    meta = APP_FORMATS.get(str(ext).lower())
+    if not meta:
+        return False
+    return DB.setting(meta["setting"], "1") == "1"
+
+
+def enabled_app_formats():
+    return [ext for ext in APP_FORMATS if app_format_enabled(ext)]
+
+
+def app_format_label(ext):
+    return APP_FORMATS.get(str(ext).lower(), {}).get("name", str(ext).upper().lstrip("."))
+
+
+def strip_ansi(text):
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text or "")
+
+
+def iter_json_values(text):
+    """Yield complete JSON values embedded in noisy engine stdout/stderr."""
+    clean = strip_ansi(text)
+    decoder = json.JSONDecoder()
+    i, n = 0, len(clean)
+    while i < n:
+        while i < n and clean[i] not in "[{":
+            i += 1
+        if i >= n:
+            break
+        try:
+            value, end = decoder.raw_decode(clean[i:])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            i += 1
+            continue
+        yield value
+        i += max(1, end)
+
+
+def _boolish(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first(d, *names):
+    for name in names:
+        if isinstance(d, dict) and name in d and d[name] not in (None, ""):
+            return d[name]
     return None
 
-def _looks_ehi(b): return len(b)>32 and b[:2] != b'\x1f\x8b' and any(x in b[:128] for x in (b'EHI',b'HTTP'))
-def _looks_hc(b):
-    try:return len(b)>20 and all(c in b'0123456789abcdefABCDEF\r\n\t ' for c in b[:200])
-    except:return False
-def _looks_dark(b):
-    try:
-        s=b.decode('utf-8-sig').strip(); raw=s.split('://',1)[-1]; o=json.loads(__import__('base64').b64decode(raw+'='*((4-len(raw)%4)%4))); return isinstance(o,dict) and 'encryptedLockedConfig' in o
-    except:return False
-def _looks_ssc(b,name):
-    try:
-        s=b.decode('utf-8-sig').strip(); s=s[6:] if s.startswith('ssc://') else s; s=re.sub(r'\s+','',s); return len(s)>=32 and len(s)%2==0 and bool(re.fullmatch(r'[0-9a-fA-F]+',s))
-    except:return False
 
 
-# ===== normalize.py =====
-import json
-from typing import Any
-
-def _first(d,*keys):
-    if not isinstance(d,dict):return None
-    for k in keys:
-        if k in d and d[k] not in (None,''):return d[k]
-    return None
-
-def _int(v):
-    try:return int(v)
-    except:return None
-
-def _alpn(v):
-    if isinstance(v,list):return [str(x) for x in v if str(x)]
-    if isinstance(v,str):return [x.strip() for x in v.split(',') if x.strip()]
-    return []
-
-def iter_profiles(value):
-    if isinstance(value,str):
-        s=value.strip()
-        if s.startswith(('{','[')):
-            try:yield from iter_profiles(json.loads(s))
-            except:pass
-        return
-    if isinstance(value,list):
-        for x in value:yield from iter_profiles(x)
-        return
-    if not isinstance(value,dict):return
-    proto=_first(value,'protocol','Protocol','v2rProtocol')
-    addr=_first(value,'server','address','Hostname','hostname','v2rHost','add')
-    port=_int(_first(value,'serverPort','port','Port','v2rPort'))
-    uid=_first(value,'uuid','UUID','UserID','userId','v2rUserId','id')
-    if proto and addr and port and str(proto).lower() in {'vless','vmess'} and uid:
-        yield NormalizedConfig(protocol=str(proto).lower(),address=str(addr),port=port,uuid=str(uid),remark=_first(value,'remarks','remark','Remark','name','title'),network=_first(value,'network','net','TransferProtocol','v2rNetwork'),security=_first(value,'security','tls','TLSType','v2rTleSecurityType'),path=_first(value,'path','Path','v2rHttpPath'),host=_first(value,'host','Host','v2rHostHeader','hostHeader'),sni=_first(value,'sni','SNI','serverName','v2rTlsSni'),alpn=_alpn(_first(value,'alpn','Alpn','v2rTleAlpn')),fingerprint=_first(value,'fingerprint','FingerPrint','fp','v2rTleFingerprintType'),flow=_first(value,'flow','Flow'),extra=value)
-    child=value.get('v2rayProfile')
-    if isinstance(child,dict):yield from iter_profiles(child)
-    for k,v in value.items():
-        if isinstance(v,(dict,list)) and k!='v2rayProfile':yield from iter_profiles(v)
-
-def normalize_all(parsed_values):
-    out=[]; seen=set()
-    for root in parsed_values:
-        for p in iter_profiles(root):
-            key=(p.protocol,p.address,p.port,p.uuid,p.password,p.network,p.security,p.path,p.host,p.sni,tuple(p.alpn),p.fingerprint,p.flow,json.dumps(p.extra,ensure_ascii=False,sort_keys=True,default=str))
-            if key not in seen:seen.add(key);out.append(p)
-    return out
+def _clean_remark(value):
+    value = re.sub(r"<[^>]+>", " ", str(value or ""))
+    value = html.unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:120]
 
 
-# ===== uri.py =====
-import base64,json
-from urllib.parse import quote,urlencode
+def _csv_list(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value).split(",") if x.strip()]
 
-def vmess_uri(p:NormalizedConfig)->str|None:
-    if p.protocol!='vmess' or not p.uuid:return None
-    obj={'v':'2','ps':p.remark or '', 'add':p.address,'port':str(p.port),'id':p.uuid,'aid':'0','scy':'auto'}
-    if p.network:obj['net']=p.network
-    if p.network=='ws':
-        if p.path is not None:obj['path']=p.path
-        if p.host is not None:obj['host']=p.host
-    elif p.network in {'httpupgrade','http-upgrade'}:
-        obj['net']='httpupgrade';
-        if p.path is not None:obj['path']=p.path
-        if p.host is not None:obj['host']=p.host
-    elif p.network=='xhttp':
-        obj['net']='xhttp'
-        if p.path is not None:obj['path']=p.path
-        if p.host is not None:obj['host']=p.host
-    if p.security in {'tls','ssl'}:
-        obj['tls']='tls'
-        if p.sni is not None:obj['sni']=p.sni
-        if p.alpn:obj['alpn']=','.join(p.alpn)
-        if p.fingerprint is not None:obj['fp']=p.fingerprint
-    return 'vmess://'+base64.urlsafe_b64encode(json.dumps(obj,ensure_ascii=False,separators=(',',':')).encode()).decode().rstrip('=')
 
-def vless_uri(p:NormalizedConfig)->str|None:
-    if p.protocol!='vless' or not p.uuid:return None
-    q=[]
-    if p.network:q.append(('type',p.network))
-    if p.security:q.append(('security','tls' if p.security=='ssl' else p.security))
-    if p.network=='ws':
-        if p.host is not None:q.append(('host',p.host))
-        if p.path is not None:q.append(('path',p.path))
-    elif p.network in {'httpupgrade','http-upgrade','xhttp'}:
-        if p.host is not None:q.append(('host',p.host))
-        if p.path is not None:q.append(('path',p.path))
-    if p.sni is not None:q.append(('sni',p.sni))
-    if p.alpn:q.append(('alpn',','.join(p.alpn)))
-    if p.fingerprint is not None:q.append(('fp',p.fingerprint))
-    if p.flow is not None:q.append(('flow',p.flow))
-    uri=f'vless://{quote(p.uuid,safe="")}@{p.address}:{p.port}'
-    if q:uri+='?'+urlencode(q)
-    if p.remark:uri+='#'+quote(str(p.remark),safe='')
+def _xray_base(remark, outbound):
+    return {
+        "remarks": _clean_remark(remark) or "Star Decryptor",
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"tag": "socks", "port": 10808, "protocol": "socks", "settings": {"auth": "noauth", "udp": True, "userLevel": 8}, "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}}],
+        "outbounds": [outbound,
+            {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIP"}, "mux": {"enabled": False, "concurrency": 8, "xudpConcurrency": 8, "xudpProxyUDP443": ""}},
+            {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}, "mux": {"enabled": False, "concurrency": 8, "xudpConcurrency": 8, "xudpProxyUDP443": ""}}
+        ],
+        "dns": {"servers": ["1.1.1.1"]},
+        "routing": {"domainStrategy": "IPIfNonMatch", "rules": []},
+    }
+
+
+def _finish_xray(cfg):
+    cfg["dns"]["hosts"] = {
+        "domain:googleapis.cn": "googleapis.com",
+        "dns.alidns.com": ["223.5.5.5", "223.6.6.6", "2400:3200::1", "2400:3200:baba::1"],
+        "one.one.one.one": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"],
+        "dot.pub": ["1.12.12.12", "120.53.53.53"],
+        "dns.google": ["8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"],
+        "dns.quad9.net": ["9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"],
+        "common.dot.dns.yandex.net": ["77.88.8.8", "77.88.8.1", "2a02:6b8::feed:0ff", "2a02:6b8:0:1::feed:0ff"],
+    }
+    cfg["routing"]["rules"] = [
+        {"type": "field", "ip": ["1.1.1.1"], "outboundTag": "proxy", "port": "53"},
+        {"type": "field", "ip": ["223.5.5.5"], "outboundTag": "direct", "port": "53"},
+    ]
+    return cfg
+
+
+def build_xray_config(protocol, profile, remark=None):
+    if not isinstance(profile,dict): return None
+    p=str(protocol or _first(profile,"protocol","Protocol","v2rProtocol") or "").lower()
+    address=_first(profile,"address","server","Hostname","hostname","v2rHost","add")
+    port=_first(profile,"port","Port","serverPort","v2rPort")
+    uid=_first(profile,"id","uuid","UUID","UserID","userId","v2rUserId","password")
+    if not address or not port or not uid or p not in {"vless","vmess"}: return None
+    try: port=int(port)
+    except Exception:return None
+    network=str(_first(profile,"network","net","TransferProtocol","v2rNetwork") or "tcp").lower()
+    security=str(_first(profile,"security","tls","TLSType","v2rTleSecurityType") or "").lower()
+    if security in {"none",""}: security=""
+    elif security=="ssl": security="tls"
+    user={"id":str(uid),"level":8}
+    if p=="vless":
+        user["encryption"]=str(_first(profile,"encryption","EncryptMethod","method") or "none")
+        flow=_first(profile,"flow","Flow")
+        if flow and str(flow).lower()!="none":user["flow"]=str(flow)
+    else:
+        try: aid=int(_first(profile,"alterId","AlterID","aid","v2rAlterId") or 0)
+        except Exception: aid=0
+        user["alterId"]=aid;user["security"]=str(_first(profile,"securityMethod","vmessSecurity","scy","v2rVmessSecurity") or "auto")
+    outbound={"tag":"proxy","protocol":p,"settings":{"vnext":[{"address":str(address),"port":port,"users":[user]}]}}
+    stream={"network":network}
+    if security:stream["security"]=security
+    path=str(_first(profile,"path","Path","v2rHttpPath") or "")
+    host=str(_first(profile,"host","Host","v2rHostHeader","hostHeader") or "")
+    if network=="ws":stream["wsSettings"]={"path":path or "/","headers":{"Host":host}}
+    elif network in {"httpupgrade","http-upgrade"}:
+        stream["httpupgradeSettings"]={"path":path or "/"}
+        if host:stream["httpupgradeSettings"]["host"]=host
+    elif network in {"xhttp","x-http","splithttp"}:
+        stream["xhttpSettings"]={"path":path or "/"}
+        if host:stream["xhttpSettings"]["host"]=host
+    elif network=="grpc":stream["grpcSettings"]={"serviceName":str(_first(profile,"serviceName","grpcServiceName") or "")}
+    else:stream["tcpSettings"]={"header":{"type":str(_first(profile,"headerType","FakeType","v2rTcpHeaderType") or "none")}}
+    if security=="tls":
+        t={"allowInsecure":_boolish(_first(profile,"allowInsecure","TlsAllowInsecure","v2rTlsAllowInsecure","insecure")),"serverName":str(_first(profile,"sni","SNI","serverName","v2rTlsSni") or ""),"alpn":_csv_list(_first(profile,"alpn","Alpn","v2rTleAlpn")),"fingerprint":str(_first(profile,"fingerprint","FingerPrint","fp","v2rTleFingerprintType") or ""),"show":False}
+        stream["tlsSettings"]={k:v for k,v in t.items() if v not in ("",None,[]) or k in {"allowInsecure","show"}}
+    elif security=="reality":
+        r={"show":False,"fingerprint":str(_first(profile,"fingerprint","FingerPrint","fp") or "chrome"),"serverName":str(_first(profile,"sni","SNI","serverName") or ""),"publicKey":str(_first(profile,"publicKey","PublicKey","pbk") or ""),"shortId":str(_first(profile,"shortId","ShortId","sid") or "")}
+        stream["realitySettings"]={k:v for k,v in r.items() if v not in ("",None)}
+    outbound["streamSettings"]=stream;outbound["mux"]={"enabled":False,"concurrency":-1,"xudpConcurrency":8,"xudpProxyUDP443":""}
+    return _finish_xray(_xray_base(remark,outbound))
+
+def build_vmess_from_profile(profile,remarks=None):
+    cfg=build_xray_config("vmess",profile,remarks)
+    if not cfg:return None
+    o=cfg["outbounds"][0];v=o["settings"]["vnext"][0];u=v["users"][0];ss=o["streamSettings"]
+    obj={"v":"2","ps":cfg["remarks"],"add":v["address"],"port":str(v["port"]),"id":u["id"],"aid":str(u.get("alterId",0)),"scy":u.get("security","auto"),"net":ss.get("network","tcp"),"type":"none","host":"","path":"","tls":"","sni":"","alpn":"","fp":""}
+    if obj["net"]=="ws":obj["host"]=ss.get("wsSettings",{}).get("headers",{}).get("Host","");obj["path"]=ss.get("wsSettings",{}).get("path","")
+    elif obj["net"]=="xhttp":obj["host"]=ss.get("xhttpSettings",{}).get("host","");obj["path"]=ss.get("xhttpSettings",{}).get("path","")
+    elif obj["net"]=="httpupgrade":obj["host"]=ss.get("httpupgradeSettings",{}).get("host","");obj["path"]=ss.get("httpupgradeSettings",{}).get("path","")
+    if ss.get("security")=="tls":
+        t=ss.get("tlsSettings",{});obj.update({"tls":"tls","sni":t.get("serverName",""),"alpn":",".join(t.get("alpn",[])),"fp":t.get("fingerprint","")})
+    return "vmess://"+base64.urlsafe_b64encode(json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()).decode().rstrip("=")
+
+def build_vless_from_v2ray_profile(profile,remarks=None):
+    cfg=build_xray_config("vless",profile,remarks)
+    if not cfg:return None
+    o=cfg["outbounds"][0];v=o["settings"]["vnext"][0];u=v["users"][0];ss=o["streamSettings"]
+    q=[("encryption",u.get("encryption","none")),("type",ss.get("network","tcp"))]
+    if ss.get("security"):q.append(("security",ss["security"]))
+    net=ss.get("network")
+    if net=="ws":q += [("host",ss.get("wsSettings",{}).get("headers",{}).get("Host","")),("path",ss.get("wsSettings",{}).get("path","/"))]
+    elif net=="httpupgrade":q += [("host",ss.get("httpupgradeSettings",{}).get("host","")),("path",ss.get("httpupgradeSettings",{}).get("path","/"))]
+    elif net=="xhttp":q += [("host",ss.get("xhttpSettings",{}).get("host","")),("path",ss.get("xhttpSettings",{}).get("path","/"))]
+    if ss.get("security")=="tls":
+        t=ss.get("tlsSettings",{});q += [("sni",t.get("serverName","")),("alpn",",".join(t.get("alpn",[]))), ("fp",t.get("fingerprint",""))]
+        if t.get("allowInsecure"):q.append(("allowInsecure","1"))
+    if u.get("flow"):q.append(("flow",u["flow"]))
+    uri="vless://"+quote(str(u["id"]),safe="")+"@"+str(v["address"])+":"+str(v["port"])
+    if q:uri+="?"+urlencode([(k,v) for k,v in q if v not in (None,"")])
+    if cfg["remarks"]:uri+="#"+quote(cfg["remarks"],safe="")
     return uri
 
-def build_uri(p):return vmess_uri(p) if p.protocol=='vmess' else vless_uri(p)
+def _walk_profiles(value,inherited_remarks=None):
+    if isinstance(value,dict):
+        remarks=_clean_remark(_first(value,"remarks","remark","Remark","name","title","configMessage")) or inherited_remarks
+        protocol=_first(value,"protocol","Protocol","v2rProtocol")
+        if protocol and str(protocol).lower() in {"vless","vmess"}:
+            address=_first(value,"server","address","Hostname","hostname","v2rHost","add");port=_first(value,"serverPort","port","Port","v2rPort");uid=_first(value,"uuid","UUID","UserID","userId","v2rUserId","id")
+            if address and port and uid:yield str(protocol).lower(),value,remarks
+        child=value.get("v2rayProfile")
+        if isinstance(child,dict):
+            uid=_first(child,"uuid","id","password")
+            if _first(child,"server","address") and _first(child,"serverPort","port") and uid:
+                proto=str(_first(child,"protocol","Protocol") or "vless").lower();proto=proto if proto in {"vless","vmess"} else "vless"
+                yield proto,child,_clean_remark(_first(child,"remarks","remark","name")) or remarks
+        for child in value.values():
+            if isinstance(child,(dict,list)):yield from _walk_profiles(child,remarks)
+    elif isinstance(value,list):
+        for child in value:yield from _walk_profiles(child,inherited_remarks)
+
+def build_profile_outputs(json_values):
+    links=[];configs=[];seen_l=set();seen_c=set()
+    for value in json_values:
+        for proto,profile,remarks in _walk_profiles(value):
+            uri=build_vmess_from_profile(profile,remarks) if proto=="vmess" else build_vless_from_v2ray_profile(profile,remarks)
+            if uri:
+                pp=uri.split("://",1)[0].lower()
+                if pp in OUTPUT_PROTOCOLS and app_output_protocol_enabled(pp) and uri not in seen_l:seen_l.add(uri);links.append(uri)
+            cfg=build_xray_config(proto,profile,remarks)
+            if cfg:
+                key=json.dumps(cfg,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+                if key not in seen_c:seen_c.add(key);configs.append(cfg)
+    return links,configs
+
+def extract_structured_uris(text):
+    found, seen = [], set()
+    def add(uri):
+        uri = normalize_link(uri)
+        if not uri or "://" not in uri: return
+        proto = uri.split("://",1)[0].lower()
+        if proto not in OUTPUT_PROTOCOLS or not app_output_protocol_enabled(proto): return
+        if uri not in seen: seen.add(uri); found.append(uri)
+    def walk(value, inherited_remarks=None):
+        if isinstance(value, dict):
+            remarks = _clean_remark(_first(value, "remarks", "remark", "Remark", "name", "title")) or inherited_remarks
+            protocol = _first(value, "protocol", "Protocol", "v2rProtocol")
+            if protocol and _first(value, "server", "address", "Hostname", "hostname", "v2rHost", "add"):
+                if str(protocol).lower() in {"vless","vmess"}:
+                    add(build_vless_from_v2ray_profile(value, remarks) if str(protocol).lower()=="vless" else build_vmess_from_profile(value, remarks))
+            for key, child in value.items():
+                if isinstance(child, str) and "://" in child:
+                    for uri in URL_RE.findall(child): add(uri)
+                if key in {"v2rayProfile", "Common"} and isinstance(child, (dict,list)): walk(child, remarks)
+                elif isinstance(child, (dict,list)): walk(child, remarks)
+        elif isinstance(value, list):
+            for child in value: walk(child, inherited_remarks)
+    for value in iter_json_values(text): walk(value)
+    return found
+
+def app_output_protocol_enabled(proto):
+    # Output protocol switches are intentionally not app-format switches. Keep
+    # all protocols enabled by default and allow optional DB keys for backwards
+    # compatibility with databases that already contain them.
+    key = f"output_{proto}"
+    if DB.conn is None:
+        return True
+    return DB.setting(key, "1") == "1"
 
 
-# ===== validators.py =====
-import json
-from urllib.parse import urlsplit
+def extract_links(text):
+    """Extract only genuine supported URI schemes; never UUID/IP/host text."""
+    found, seen = [], set()
+    for match in URL_RE.findall(strip_ansi(text or "")):
+        value = normalize_link(match)
+        if not value or "://" not in value:
+            continue
+        proto = value.split("://", 1)[0].lower()
+        if proto in OUTPUT_PROTOCOLS and app_output_protocol_enabled(proto) and value not in seen:
+            seen.add(value)
+            found.append(value)
+    return found
 
-def validate_uri(uri):
+
+def extract_labeled_keys(text):
+    found, seen = [], set()
+    text = text or ""
+    for key in KEY_LABEL_RE.findall(text):
+        value = str(key).strip().strip('"\'.,;')
+        if value and value not in seen:
+            seen.add(value); found.append(value)
+    for key in JSON_KEY_RE.findall(text):
+        value = str(key).strip().strip('"\'.,;')
+        if value and value not in seen:
+            seen.add(value); found.append(value)
+    return found
+
+
+def json_objects_from_text(text):
+    values = []
+    for value in iter_json_values(text or ""):
+        values.append(value)
+    return values
+
+
+def is_probably_text(path):
     try:
-        u=urlsplit(uri)
-        if u.scheme not in {'vless','vmess'} or not u.netloc:return False,'invalid URI structure'
-        if u.scheme=='vless' and not u.username:return False,'VLESS UUID missing'
-        return True,''
-    except Exception as e:return False,str(e)
-
-def validate_xray(cfg):
-    if not isinstance(cfg,dict) or not isinstance(cfg.get('outbounds'),list) or not cfg['outbounds']:return False,'missing outbounds'
-    for o in cfg['outbounds']:
-        if o.get('protocol') not in {'vless','vmess'}:return False,'unsupported outbound protocol'
-        try:v=o['settings']['vnext'][0]; int(v['port']); users=v['users'];
-        except Exception:return False,'invalid vnext structure'
-        if not v.get('address') or not users:return False,'address/users missing'
-        if not users[0].get('id'):return False,'user id missing'
-    try:json.dumps(cfg,ensure_ascii=False,allow_nan=False)
-    except Exception as e:return False,f'not JSON serializable: {e}'
-    return True,''
-
-
-# ===== xray.py =====
-from typing import Any
-
-def xray_config(p:NormalizedConfig)->dict[str,Any]|None:
-    if p.protocol not in {'vless','vmess'} or not p.uuid:return None
-    user={'id':p.uuid}
-    if p.protocol=='vless':
-        user['encryption']='none'
-        if p.flow:user['flow']=p.flow
-    else:
-        user['alterId']=0; user['security']='auto'
-    out={'protocol':p.protocol,'settings':{'vnext':[{'address':p.address,'port':p.port,'users':[user]}]}}
-    stream={}
-    if p.network:stream['network']=p.network
-    sec='tls' if p.security=='ssl' else p.security
-    if sec:stream['security']=sec
-    net=(p.network or '').lower()
-    if net=='ws':
-        s={}
-        if p.path is not None:s['path']=p.path
-        if p.host is not None:s['headers']={'Host':p.host}
-        if s:stream['wsSettings']=s
-    elif net in {'httpupgrade','http-upgrade'}:
-        s={}
-        if p.path is not None:s['path']=p.path
-        if p.host is not None:s['host']=p.host
-        if s:stream['httpupgradeSettings']=s
-    elif net=='xhttp':
-        s={}
-        if p.path is not None:s['path']=p.path
-        if p.host is not None:s['host']=p.host
-        if s:stream['xhttpSettings']=s
-    elif net=='grpc' and p.extra.get('serviceName') is not None:stream['grpcSettings']={'serviceName':str(p.extra['serviceName'])}
-    elif net=='tcp' and p.extra.get('headerType') is not None:stream['tcpSettings']={'header':{'type':str(p.extra['headerType'])}}
-    if sec=='tls':
-        t={}
-        if p.sni is not None:t['serverName']=p.sni
-        if p.alpn:t['alpn']=p.alpn
-        if p.fingerprint is not None:t['fingerprint']=p.fingerprint
-        if 'allowInsecure' in p.extra:t['allowInsecure']=bool(p.extra['allowInsecure'])
-        if t:stream['tlsSettings']=t
-    elif sec=='reality':
-        r={}
-        for k in ('fingerprint','serverName','publicKey','shortId'):
-            v={'fingerprint':p.fingerprint,'serverName':p.sni,'publicKey':p.extra.get('publicKey'),'shortId':p.extra.get('shortId')}[k]
-            if v not in (None,''):r[k]=v
-        if r:stream['realitySettings']=r
-    if stream:out['streamSettings']=stream
-    return {'remarks':p.remark,'outbounds':[out]} if p.remark else {'outbounds':[out]}
-
-
-# ===== ehi.py =====
-
-L1_KEY=bytes.fromhex('7e1210f7aab956f7a668bda6e57feddb7f84ad840aef8d27b1b969959be3ab6c'); L2_KEY=bytes.fromhex('b2bc617c32d8b9eb1943a5ffa8051eea'); EOO=b'null=V5kU5+FFrY\x00'
-BYPASS=(bytes.fromhex('221d572349555f1d112133236b1f4a3f'),bytes.fromhex('5543494c53443e3f4a6a4539384e776a'),bytes.fromhex('374c2541575e4d531a3c327b75431e5f'))
-STANDARD=(bytes.fromhex('2c5d1147bbad422b3b334d4d235f1a53'),bytes.fromhex('522b01433a5e8b2fc7549e1ad368e541'),bytes.fromhex('337a1035aaedf3458ca167e92d74b839'))
-CUSTOM='RkLC2QaVMPYgGJW/A4f7qzDb9e+t6Hr0Zp8OlNyjuxKcTw1o5EIimhBn3UvdSFXs'; STD='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-TRANS=str.maketrans(CUSTOM,STD)
-
-def b64(s):
- s=s.replace('?',''); s+='='*((4-len(s)%4)%4); return base64.b64decode(s.translate(TRANS))
-def xor_layer(s,key):
- if not s:return s
- try:
-  raw=bytes.fromhex(b64(s[::-1]).decode('ascii')); out=bytes(b^ord(key[i%len(key)]) for i,b in enumerate(raw) if (b^ord(key[i%len(key)]))!=0); return out.decode('utf-8')
- except:return None
-def xxtea(data,key):
- if len(data)%4:data+=b'\0'*(4-len(data)%4)
- k=struct.unpack('<4I',key.ljust(16,b'\0')[:16]); n=len(data)//4; v=list(struct.unpack(f'<{n}I',data)); delta=0x9e3779b9; sm=((6+52//n)*delta)&0xffffffff; y=v[0]
- while sm:
-  e=(sm>>2)&3
-  for p in range(n-1,0,-1):
-   z=v[p-1]; mx=(((z>>5)^(y<<2))+((y>>3)^(z<<4)))^((sm^y)+(k[(p&3)^e]^z)); y=v[p]=(v[p]-mx)&0xffffffff
-  z=v[n-1]; mx=(((z>>5)^(y<<2))+((y>>3)^(z<<4)))^((sm^y)+(k[e]^z)); y=v[0]=(v[0]-mx)&0xffffffff; sm=(sm-delta)&0xffffffff
- dec=struct.pack(f'<{n}I',*v); ln=v[-1]; return dec[:ln] if 0<ln<=n*4 else dec.rstrip(b'\0')
-def decode_message(s):
- try:
-  raw=base64.b64decode(s+'='*((4-len(s)%4)%4)); u16=raw.decode('utf-8',errors='replace').encode('utf-16-be'); chars=struct.unpack(f'>{len(u16)//2}H',u16); keys=[ord(c) for c in 'EHIMSG']; x=bytes().join(struct.pack('>H',c^keys[i%6]) for i,c in enumerate(chars)); return x.decode('utf-16-be').encode('utf-16').decode('utf-16')
- except:return s
-def inner(d,salt):
- out={}
- for k,v in d.items(): out[k]=decode_message(v) if k=='configMessage' and isinstance(v,str) else (xor_layer(v,salt) if isinstance(v,str) and v else v)
- return out
-def master(c):
- s=''.join(str(c.get(k,'')) for k in ('configAesKey','configIdentifier','configSalt','configTimestamp','configExpiryTimestamp','lockModes','lockModesHash','configHwid','configLockMobileOperatorId') if c.get(k,'')); return hashlib.sha256(s.encode()).digest()
-def parse_ehi(file_bytes):
- f=io.BytesIO(file_bytes)
- def rutf():
-  z=f.read(2)
-  if len(z)<2: raise ValueError('truncated UTF length')
-  n=struct.unpack('>H',z)[0]; d=f.read(n); 
-  if len(d)!=n: raise ValueError('truncated UTF payload')
-  return d.decode('utf-8')
- rutf(); f.read(8); rutf(); f.read(8); z=f.read(4)
- if len(z)<4: raise ValueError('missing payload length')
- n=struct.unpack('>I',z)[0]; f.read(8); payload=f.read(n)
- if len(payload)!=n: raise ValueError('truncated encrypted payload')
- config=None; iv=None
- for candidate in BYPASS+STANDARD:
-  try:
-   l1=unpad(AES.new(L1_KEY,AES.MODE_CBC,candidate).decrypt(payload),16).decode('utf-8'); parts=l1.split(':')
-   if len(parts)<3: continue
-   c2=unpad(AES.new(L2_KEY,AES.MODE_CBC,base64.b64decode(parts[0])).decrypt(base64.b64decode(parts[2])),16); raw=xxtea(c2,EOO); st=raw.find(b'{')
-   if st>=0: config=json.loads(raw[st:].decode('utf-8')); iv=candidate; break
-  except Exception: continue
- if not isinstance(config,dict): raise ValueError('EHI cryptographic validation failed')
- salt=config.get('configSalt','EVZJNI')
- if iv in BYPASS: final=config
- else:
-  x=xor_layer(config.get('configData',''),salt)
-  if not x: raise ValueError('EHI configData XOR layer failed')
-  raw=base64.b64decode(x)
-  if len(raw)<=50: raise ValueError('EHI authenticated payload is truncated')
-  try:
-   key=hash_secret_raw(secret=master(config),salt=raw[10:26],time_cost=int.from_bytes(raw[1:5],'little'),memory_cost=int.from_bytes(raw[5:9],'little'),parallelism=raw[9],hash_len=32,type=Type.ID)
-   c=ChaCha20_Poly1305.new(key=key,nonce=raw[26:50]); c.update(raw[:26]); final=json.loads(c.decrypt_and_verify(raw[50:-16],raw[-16:]).decode('utf-8'))
-  except Exception as e: raise ValueError(f'EHI authenticated decryption failed: {e}')
- final=inner(final,salt)
- for k in ('v2rRawJson','overwriteServerData'):
-  v=final.get(k)
-  if isinstance(v,str):
-   try:
-    a=v.find('{'); b=v.rfind('}');
-    if a>=0 and b>a: final[k]=json.loads(v[a:b+1])
-   except Exception: pass
- return final
-
-
-# ===== hc.py =====
-CHACHA=[bytes.fromhex(x) for x in ['2be4342943c6f91ff58987f41a1aafd179eeb4e053f5cea55b11d6a7db58bd7d','3380aa278b744ba5b529a7f32fa803e48749280dae378345d9b526cf1dbce372','cea9305c95168b162a335b137c61983b8df54e6375da01136547890f14c5fac3','4beeace0e42bae8f29470cf40cf2dfacd5f4e1f751912bf52e803c8c85792193','f8e5f6ebea90558eb32229da24fd0fb7d813091dafe89bb2954fda33b4c60f63','81342f558a6273bac4548d473f54c4ffc7c41747dee81369acab9c787d41ab9c','45635e6fc70486e2fd10d3c2b4780f02d0b4c5f4aa929fc54f86bb8fa4417944','3d632a251c9820f2baf83e15498d27548fc67921cb437f8ce48505989378adea']]
-RST=[b'JN1k3YHc2.6_v235',b'JN1k3YHc_2.7_v71',b'JN1k3YHc2.7.ps69',b'JN1k3YHc2.7.6950',b'Jn1K3yHc2.8.ps08',b'Jn1K3yHc2.9.ps6c',b'Zk:L7>WKaiK*s9>D',b'!<f!&WIlM**R.B0X',b'b4a5opinx2uloec6']
-OLD=bytes([0xd5,0xd4,0xd3,0xd2,0xd1,0xd0,0xcf,0xce,0xcd,0xcc,0xbd,0xbc,0xbb,0xba,0xb9,0xb8,0xb7,0xb6,0xb5,0xb4]); NEW=bytes([8,9,10,11,12,13,14,15,17,17,5,4,3,2,1,0,255,254,253,252]); NONCE=b'\xdb'*8; RX=bytes(range(2,22))
-MAP={0:'payload',1:'proxy',2:'lockAllConfig',3:'blockedByRoot',4:'expiryTime',5:'noteEnabled',6:'notes',7:'sshField',8:'mobileDataAndLockProvider',9:'unlockUserAndPass',10:'ovpnConfig',11:'ovpnUserAndPass',12:'sni',13:'unlockUserAndPass2',14:'unknown14',15:'blockedByHwid',16:'cloudconfig',17:'psiphon',18:'name',19:'blockArea',20:'connectionMode',21:'blockedByPassword',22:'unknown22',23:'extraSniffer',24:'psiphon2',25:'v2rayEnabled',26:'v2rayConfig',27:'version',28:'slowdnsEnabled',29:'slowdnsServer',30:'slowdnsPublickey',31:'dnsResolver'}
-def cleanhex(s):
- c=re.sub('[^0-9a-fA-F]','',str(s or '')); return ('0'+c) if len(c)%2 else c
-def abc(s,key,nonce=NONCE):
- try:
-  d=bytes.fromhex(cleanhex(s));
-  if len(d)<=16:return ''
-  c=ChaCha20.new(key=key,nonce=nonce); c.seek(64); return c.decrypt(d[:-16]).decode('utf-8',errors='ignore')
- except:return ''
-def jkl(s,new=False):
- if not s:return s
- k=NEW if new else OLD
- try:
-  d=bytearray(base64.b64decode(s+'='*((4-len(s)%4)%4),validate=True))
-  for i,v in enumerate(d): d[i]=(((v^255)&0xca)|(v&0x35))^(((k[i%20]^255)&0xca)|(k[i%20]&0x35))
-  return base64.b64decode(d.decode(),validate=True).decode()
- except:return s
-def field(token,dyn):
- if not token or token in {'true','false','lifeTime','[splitPsiphon][splitPsiphon]'} or token.startswith('<'):return token
- cands=[]; h=cleanhex(token)
- if len(h)>=32 and re.fullmatch('[0-9a-fA-F]+',h):
-  try:cands.append(bytes.fromhex(h))
-  except:pass
- if len(token)>16:
-  cands += [token.encode('latin-1',errors='ignore'),token.encode('utf-8')]
- for raw in cands:
-  if len(raw)<=16:continue
-  for key in CHACHA:
-   try:
-    c=ChaCha20.new(key=key,nonce=dyn); c.seek(64); s=c.decrypt(raw[:-16]).decode('utf-8',errors='ignore')
-    for n in (True,False):
-     z=jkl(s,n)
-     if z!=s and sum(x.isprintable() or x in '\r\n\t' for x in z)/max(1,len(z))>.8:return z
-    if sum(x.isprintable() or x in '\r\n\t' for x in s)/max(1,len(s))>.9:return s
-   except:pass
- for n in (True,False):
-  z=jkl(token,n)
-  if z!=token:return z
- return token
-def parse_hc(b):
- key=bytes.fromhex('e382e4b8adc386f09f9293'); raw=bytes(x^key[i%len(key)] for i,x in enumerate(b.decode('utf-8',errors='ignore').encode('latin-1',errors='ignore'))).decode('utf-8')
- outer=abc(raw,CHACHA[5]);
- if not outer or not outer.startswith('{'):raise ValueError('HC outer ChaCha20 validation failed')
- obj=json.loads(outer); cfg=obj.get('cfg',{}); new=isinstance(cfg,dict) and 'content' in cfg; meta={}; prot={}
- if new:
-  for k,n in {'b':'hwid','f':'area'}.items():
-   v=str(obj.get(k) or cfg.get(k) or '');
-   if v:meta[n]=prot[n]=v
-  target,split=cfg.get('content'),'[splitConfig]'
- else:
-  a=obj.get('a') if isinstance(obj.get('a'),dict) else {}
-  for k,n in {'bb':'hwid','e':'password','fe':'area','ed':'provider'}.items():
-   v=obj.get(k) if k=='e' else a.get(k); z=abc(str(v),CHACHA[7]) if v else ''
-   if z:meta[n]=prot[n]=z
-  target,split=obj.get('xy') or a.get('xy'),obj.get('uv') or a.get('uv')
- if not target or not split:raise ValueError('HC wrapper has no configuration payload')
- h,p,pr,a=meta.get('hwid'),meta.get('password'),meta.get('provider'),meta.get('area'); dh=(h.encode().hex()*2) if h and not any((p,pr,a)) else ''.join(x.encode().hex() for x in (p,h,pr,a) if x); dyn=bytearray(NONCE)
- if dh:
-  for i,x in enumerate(bytes.fromhex(dh)[:8]):dyn[i]=x
- dec=None
- if new:
-  try:
-   bs=bytes(x^RX[i%20] for i,x in enumerate(str(target).encode())); ct=base64.b64decode(bs)
-   for k in RST:
+        sample = path.read_bytes()[:4096]
+    except Exception:
+        return False
+    if b"\x00" in sample:
+        return False
     try:
-     s=unpad(AES.new(k,AES.MODE_ECB).decrypt(ct),16).decode()
-     if split in s: dec=s;break
-    except:pass
-  except Exception: pass
-  if dec is None:
-   for k in CHACHA:
-    z=abc(str(target),k)
-    if split in z:dec=z;break
- else:dec=abc(str(target),CHACHA[1])
- if not dec:raise ValueError('HC master ciphertext could not be decrypted')
- out={}
- for i,t in enumerate(dec.split(str(split))):
-  if i in {22,24}:continue
-  v=field(t,bytes(dyn)) if new else jkl(abc(t,CHACHA[7],bytes(dyn)) if re.fullmatch('[0-9a-fA-F]+',t or '') and len(t)>=16 else t)
-  if i==7:v=_cred(v,True)
-  elif i==11:v=_cred(v,False)
-  if isinstance(v,str) and v.startswith(('{','[')):
-   try:v=json.loads(v)
-   except:pass
-  if v and not (isinstance(v,str) and re.fullmatch('[0-9a-fA-F]+',v)):out[MAP.get(i,f'field_{i}')]=v
- return {'Protections':prot,'Config':out}
-BRAILLE='⠁⠃⠉⠙⠑⠋⠛⠓⠊⠚⠅⠇⠍⠝⠕⠏⠟⠗⠎⠞⠥⠧⠺⠭⠽⠵⠼⠁⠼⠃⠼⠉⠼⠙⠼⠑⠼⠋⠼⠛⠼⠓⠼⠊⠚'
-def _z3a(v,iv):
- if not v:return ''
- out=bytearray()
- for m in re.finditer(r'(-?\d+)\.(-?\d+)',v):
-  a,b=int(m.group(1))-iv,int(m.group(2))-iv
-  try:out.append((a//(1<<b))%256)
-  except Exception:pass
- return out.decode('utf-8',errors='ignore')
-def _braille(v):
- try:return bytes((BRAILLE.index(v[i])*16+BRAILLE.index(v[i+1]))&255 for i in range(0,len(v)-1,2)).decode('utf-8')
- except:return v
-def _cred(v,ssh=False):
- if not v:return v
- if ssh and v[0] in BRAILLE:v=_braille(v)
- pat=r'^([\w\.-]+):([\d\-]+)@(.+):(.+)$' if ssh else r'^([^:]+):(.+)$'; m=re.match(pat,v)
- if not m:return v
- g=m.groups(); u,p=g[-2],g[-1]; iv=len(re.findall(r'(-?\d+)\.(-?\d+)',u)); ip=len(re.findall(r'(-?\d+)\.(-?\d+)',p)); du=_z3a(u,iv) or u; dp=_z3a(p,ip) or p
- return f'{g[0]}:{g[1]}@{du}:{dp}' if ssh else f'{du}:{dp}' 
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
 
 
-# ===== dark.py =====
-K256=b'$B&E)H@McQfThWmZq4t7w!z%C*F-JaNd'; K192=b'F)J@NcRfUjXn2r4u7x!A%D*G'; IV=bytes.fromhex('232e39185523184a5723586242200e05')
-def b64(s):
- s=s.replace('-','+').replace('_','/'); return base64.b64decode(s+'='*((4-len(s)%4)%4))
-def dec(d,k):return AES.new(k,AES.MODE_CFB,iv=IV,segment_size=128).decrypt(d)
-def norm(v):
- if isinstance(v,dict):return {k:norm(x) for k,x in v.items() if k!='Password'}
- if isinstance(v,list):return [norm(x) for x in v]
- if isinstance(v,bytes):
-  try:s=v.decode('utf-8'); return norm(json.loads(s)) if s.strip().startswith(('{','[')) else s
-  except:return list(v)
- if isinstance(v,str):
-  s=v.strip()
-  if s.startswith(('{','[')):
-   try:return norm(json.loads(re.sub(r'(:\s*)(\$[A-Za-z0-9_]+)',r'\1"\2"',s)))
-   except:pass
- return v
-def clean(v,k,iv):
- if isinstance(v,dict):
-  o={}
-  for a,b in v.items():
-   if isinstance(a,str) and a.startswith('Encrypted') and isinstance(b,(bytes,bytearray)):
-    try:o[a]=dec(bytes(b),k)
-    except:o[a]=b
-   else:o[a]=clean(b,k,iv)
-  return o
- if isinstance(v,list):return [clean(x,k,iv) for x in v]
- return v
-def parse_dark(data):
- s=data.decode('utf-8',errors='ignore').strip(); s=s.split('://',1)[-1] if '://' in s else s
- try:outer=json.loads(b64(s).decode('utf-8'))
- except Exception as e:raise ValueError(f'Dark Tunnel outer base64/JSON failed: {e}')
- if 'encryptedLockedConfig' not in outer:raise ValueError('Dark Tunnel encryptedLockedConfig missing')
- try:uo=msgpack.unpackb(dec(b64(outer['encryptedLockedConfig']),K256),raw=False,strict_map_key=False)
- except Exception as e:raise ValueError(f'Dark Tunnel MessagePack/AES failed: {e}')
- if 'EncryptedLockedConfig' in uo:
-  try:ui=msgpack.unpackb(dec(uo['EncryptedLockedConfig'],K192),raw=False,strict_map_key=False); uo['EncryptedLockedConfig']=clean(ui,K192,IV)
-  except Exception as e:raise ValueError(f'Dark Tunnel inner decryption failed: {e}')
- outer['encryptedLockedConfig']=uo; return norm(outer)
+def collect_engine_outputs(output_dir):
+    """Collect every generated file without assuming it is a TXT/URI output."""
+    items = []
+    for path in sorted(p for p in output_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(output_dir).as_posix()
+        size = path.stat().st_size
+        item = {"path": path, "name": rel, "size": size, "text": None, "binary": False}
+        if is_probably_text(path) and size <= 5 * 1024 * 1024:
+            item["text"] = path.read_text(encoding="utf-8", errors="replace")
+        else:
+            item["binary"] = True
+        items.append(item)
+    return items
 
 
-# ===== ssc.py =====
-N=struct.pack('<Q',0xf7479d9f87f3d074); L1=bytes.fromhex('c8a6a8ea102d5a0baf8fdb1b39cd615c0d07c1edcbde4e82cfdd309bc4587f6b'); L2=bytes.fromhex('7f9db48ffde449ad19f9ed44b8b27eee334ab4a85b972dca8ff20e4e8ed44e4e'); L3=bytes.fromhex('d39394517a48971f6e8555e994bee5bd835e5ab2f85fbd76bbd99800f32b967e')
-MAP=dict(zip('abcefg hijklmnopqrstuv wxyz'.replace(' ',''),['CONFIGS','NOTE','EXPIRY DATE','CONFIGNAME','PAYLOAD ENABLED','PAYLOAD','PROXY','PROXY PORT','TYPE','PROXY ENABLED','ADDRESS','PORT','IS PREMIUM','USERNAME','PASSWORD','TIMEOUT','PROTOCOL','VERSION','ENCRYPTION','COMPRESSIONLEVEL','DNS','NSSERVER','PUBKEY','ISDEFAULT','LOCALPORT']))
-ENC=set('ghlovxiw')
-def dec(k,n,d):c=ChaCha20.new(key=k,nonce=n);c.seek(64);return c.decrypt(d)
-def cstring(b):return b.split(b'\0')[0].decode('utf-8',errors='ignore')
-def clean(v,key=None):
- if not isinstance(v,str):return v
- v=''.join(c for c in v if ord(c)>=32)
- if key in {'ADDRESS','DNS','H','NSSERVER'}:
-  m=re.search(r'(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?',v)
-  return m.group(0) if m else ''.join(c for c in v if c.isalnum() or c in '.-_')
- if key in {'USERNAME','PASSWORD'}:
-  if v.isalnum():return v
-  m=re.match(r'^[a-zA-Z0-9!@#$%^&*()._-]+',v); return m.group(0) if m else v.strip()
- if key=='PAYLOAD':return v.split('\x00')[0] if '[crlf]' in v else v.strip()
- return v.strip()
-
-def inner_nonce(key):
- if not key or len(key)!=32:return None
- try:return bytes.fromhex(f'{key[16:32][::-1]}68{key[0:16]}')[:8]
- except:return None
-def obj(b):
- t=b.decode('utf-8',errors='ignore').split('\0')[0]; a=t.find('{');z=t.rfind('}')
- if a<0:return None
- try:return json.loads(t[a:z+1])
- except:return None
-def parse_ssc(data):
- s=data.decode('utf-8-sig',errors='ignore').strip(); s=s[6:][::-1] if s.startswith('ssc://') else s; s=''.join(s.split())
- if len(s)%2:raise ValueError('SSC hex length is odd')
- try:l1=obj(dec(L1,N,bytes.fromhex(s)))
- except Exception as e:raise ValueError(f'SSC layer 1 failed: {e}')
- if not l1:raise ValueError('SSC layer 1 JSON invalid')
- target=None
- if isinstance(l1.get('a'),str) and 'c' in l1:
-  try:target=obj(dec(L2,bytes.fromhex(l1['a'][:16]),bytes.fromhex(l1['c'])))
-  except Exception as e:raise ValueError(f'SSC layer 2 failed: {e}')
- elif isinstance(l1.get('a'),list):target=l1
- if not target:raise ValueError('SSC final configuration not found')
- configs=target.get('a')
- if isinstance(configs,list):
-  for item in configs:
-   n=inner_nonce(item.get('b')) if isinstance(item,dict) else None
-   if n:
-    for f in ENC.intersection(item):
-     v=item[f]
-     if isinstance(v,str) and len(v)>16:
-      try:item[f]=cstring(dec(L3,n,bytes.fromhex(v)))
-      except:pass
-   if isinstance(item,dict):
-    for k,v in list(item.items()):item[MAP.get(k,k)]=clean(v,MAP.get(k,k)); 
-    for k in list(item):
-     if k in MAP and k!=MAP[k]:del item[k]
-  target['a']=configs
- return _rename(target)
-def _rename(d):
- if isinstance(d,dict):return {MAP.get(k,k):_rename(v) for k,v in d.items()}
- if isinstance(d,list):return [_rename(x) for x in d]
- return clean(d, None)
-
-
-# ===== npvt.py =====
-
-def load_state(path=None):
- blob=os.getenv('NPVT_WHITEBOX_B64','').strip()
- if not blob: raise FileNotFoundError('NPVT white-box state is not configured. Set NPVT_WHITEBOX_B64.')
- try: return pickle.loads(gzip.decompress(base64.b64decode(blob,validate=True)))
- except Exception as e: raise ValueError(f'NPVT white-box state is invalid: {e}')
-
-def wb(block,p2,p3,p4,p5):
- state=list(block); perm=[0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11]
- for r in range(2):
-  state=[state[perm[i]] for i in range(16)]
-  if r==1:break
-  mid=[0]*16
-  for col in range(4):
-   t0,t1,t2,t3=[p3[r][col*4+i][state[col*4+i]] for i in range(4)]
-   for row in range(4):
-    idx=col*24+row*6; hi,lo=28-row*8,24-row*8
-    x1=p2[r][idx][(t0>>hi)&15][(t1>>hi)&15]; x2=p2[r][idx+1][(t2>>hi)&15][(t3>>hi)&15]; hv=p2[r][idx+4][x1][x2]
-    x1=p2[r][idx+2][(t0>>lo)&15][(t1>>lo)&15]; x2=p2[r][idx+3][(t2>>lo)&15][(t3>>lo)&15]; lv=p2[r][idx+5][x1][x2]; mid[col*4+row]=((hv<<4)|lv)&255
-  new=[0]*16
-  for col in range(4):
-   t0,t1,t2,t3=[p5[r][col*4+i][mid[col*4+i]] for i in range(4)]
-   for row in range(4):
-    idx=col*24+row*6; hi,lo=28-row*8,24-row*8
-    x1=p2[r][idx][(t0>>hi)&15][(t1>>hi)&15];x2=p2[r][idx+1][(t2>>hi)&15][(t3>>hi)&15];hv=p2[r][idx+4][x1][x2]
-    x1=p2[r][idx+2][(t0>>lo)&15][(t1>>lo)&15];x2=p2[r][idx+3][(t2>>lo)&15][(t3>>lo)&15];lv=p2[r][idx+5][x1][x2];new[col*4+row]=((hv<<4)|lv)&255
-  state=new
- for i in range(16):state[i]=p4[i][state[i]]
- return bytes(state)
-def parse_npvt(data,state_path=None):
- raw=data.decode('utf-8',errors='strict').strip()
- if raw.startswith('NPVTSUB1'):raw=raw[8:].strip()
- elif raw.startswith('NPVT1'):raw=raw[5:].strip()
- else:raise ValueError('NPVT header missing')
- parts=raw.split(',')
- if len(parts)<2:raise ValueError('NPVT payload field missing')
- p2,p3,p4,p5=load_state(state_path); rawb=base64.b64decode(parts[1]);
- if len(rawb)<16:raise ValueError('NPVT ciphertext shorter than IV')
- iv=bytearray(rawb[:16]);ct=rawb[16:]; out=bytearray()
- for j,b in enumerate(ct):
-  if j%16==0:
-   ks=wb(iv,p2,p3,p4,p5)
-   for k in range(15,-1,-1):
-    iv[k]=(iv[k]+1)&255
-    if iv[k]!=0:break
-  out.append(b^ks[j%16])
- try:v=json.loads(out.decode('utf-8'))
- except Exception as e:raise ValueError(f'NPVT decrypted JSON invalid: {e}')
- return v[0] if isinstance(v,list) and v else v
-
-
-# ===== pipeline =====
-@dataclass
-class PipelineResult:
-    format_key:str|None=None; format_name:str|None=None; parsed:list=field(default_factory=list); normalized:list=field(default_factory=list); uris:list[str]=field(default_factory=list); xray:list[dict]=field(default_factory=list); errors:list[str]=field(default_factory=list); warnings:list[str]=field(default_factory=list); detected_reason:str=''
-PARSERS={'ehi':parse_ehi,'hc':parse_hc,'dark':parse_dark,'ssc':parse_ssc,'npvt':parse_npvt}
-def process(data:bytes,filename:str,enabled_formats:set[str],max_configs:int=100,validate=True,npvt_state=None,do_uri=True,do_json=True)->PipelineResult:
- r=PipelineResult(); m=detect(data,filename)
- if not m:r.errors.append('فرمت فایل شناسایی نشد.');return r
- r.format_key=m.key;r.format_name=FORMATS.get(m.key,m.key);r.detected_reason=m.reason
- if m.key not in enabled_formats:r.errors.append('این فرمت توسط مدیر غیرفعال شده است.');return r
- try:
-  parsed=PARSERS[m.key](data,npvt_state) if m.key=='npvt' else PARSERS[m.key](data);r.parsed=[ParsedConfig(m.key,parsed,filename)]
- except Exception as e:r.errors.append(f'decrypt/parse: {type(e).__name__}: {e}');return r
- r.normalized=normalize_all([x.data for x in r.parsed])[:max_configs]
- for p in r.normalized:
-  if do_uri:
-   try:
-    u=build_uri(p)
-    if u:
-     ok,why=validate_uri(u) if validate else (True,'')
-     if ok:r.uris.append(u)
-     else:r.warnings.append(f'URI validation: {why}')
-   except Exception as e:r.warnings.append(f'URI generation: {e}')
-  if do_json:
-   try:
-    c=xray_config(p)
-    if c:
-     ok,why=validate_xray(c) if validate else (True,'')
-     if ok:r.xray.append(c)
-     else:r.warnings.append(f'JSON validation: {why}')
-   except Exception as e:r.warnings.append(f'JSON generation: {e}')
- return r
-
-# ===== bot =====
-VERSION="1.0.0"
-APP_NAME="Config Processor"
-BUILD_DATE="2026-09-05"
-BOT_TOKEN=os.getenv("BOT_TOKEN","").strip()
-DATA_DIR=Path(os.getenv("DATA_DIR","/app/data")); DB_PATH=DATA_DIR/"prodecryptor.db"
-DEFAULT_ADMIN_ID=5728292317
-DB=Database(DB_PATH)
-JOBS={}; CAPTCHA={}; ADMIN_STATE={}; LOG_BUFFER=[]; LOG_LOCK=asyncio.Lock(); LIMITER=None
-MAX_LOG_LINES=500
-
-class MemoryLog(logging.Handler):
-    def emit(self,record):
+def enrich_configs_from_emitted(configs, emitted_links):
+    from urllib.parse import urlsplit, parse_qs
+    supplements=[]
+    for uri in emitted_links:
         try:
-            LOG_BUFFER.append(self.format(record))
-            del LOG_BUFFER[:-MAX_LOG_LINES]
-        except Exception: pass
+            u=urlsplit(uri); proto=u.scheme.lower(); q={k:(v[-1] if v else "") for k,v in parse_qs(u.query,keep_blank_values=True).items()}
+            if proto=="vless":
+                supplements.append((proto,u.hostname,int(u.port or 0),u.username or "",q))
+        except Exception: continue
+    for cfg in configs:
+        try:
+            o=cfg["outbounds"][0];v=o["settings"]["vnext"][0];u=v["users"][0];ss=o.get("streamSettings",{})
+        except Exception: continue
+        for proto,addr,port,uid,q in supplements:
+            if str(addr)!=str(v.get("address")) or port!=int(v.get("port",-1)) or uid!=str(u.get("id")): continue
+            if ss.get("security")=="tls":
+                tls=ss.setdefault("tlsSettings",{})
+                if not tls.get("fingerprint") and q.get("fp"): tls["fingerprint"]=q["fp"]
+                if not tls.get("serverName") and q.get("sni"): tls["serverName"]=q["sni"]
+                if not tls.get("alpn") and q.get("alpn"): tls["alpn"]=q["alpn"].split(",")
+                if not tls.get("allowInsecure") and q.get("allowInsecure"): tls["allowInsecure"]=q["allowInsecure"].lower() in {"1","true","yes"}
+            break
+    return configs
 
-logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log=logging.getLogger("bot"); log.addHandler(MemoryLog())
+def analyze_engine_output(output_dir,stdout,stderr,input_filename):
+    internal=collect_engine_outputs(output_dir)
+    texts=[x["text"] for x in internal if x["text"] is not None]
+    combined="\n".join(x for x in (stdout,stderr,*texts) if x)
+    json_values=json_objects_from_text(combined)
+    profile_links,profile_configs=build_profile_outputs(json_values)
+    emitted=extract_links(combined)
+    profile_configs=enrich_configs_from_emitted(profile_configs,emitted)
+    seen=set(profile_links);links=profile_links+[u for u in emitted if u not in seen]
+    return {"input_filename":input_filename,"links":links,"keys":extract_labeled_keys(combined),"raw":"","stdout":"","stderr":"","files":[],"json_values":json_values,"xray_configs":profile_configs or xray_configs_from_links(links),"protocol_counts":protocol_counts(links)}
 
-def esc(x): return html.escape(str(x or ""),quote=True)
-def is_admin(uid:int)->bool:
-    try:return uid in {int(x) for x in DB.get("admin_ids",str(DEFAULT_ADMIN_ID)).split(',') if x.strip()}
-    except:return uid==DEFAULT_ADMIN_ID
+def links_codeblock(links):
+    # Keep every item on its own line and preserve the code-block/copy affordance.
+    return "```\n" + "\n".join(str(x).replace("`", "\u200b`") for x in links) + "\n```"
 
-def settings_reload():
-    global LIMITER
-    LIMITER=asyncio.Semaphore(max(1,int(DB.get("concurrency","4"))))
 
-def kb(rows):return InlineKeyboardMarkup(rows)
-def back(cb):return kb([[InlineKeyboardButton("🔙 بازگشت",callback_data=cb)]])
+def split_link_chunks(items, max_chars=TELEGRAM_CHUNK):
+    chunks, current = [], []
+    size = 8
+    for item in items:
+        line = str(item)
+        if current and size + len(line) + 1 > max_chars:
+            chunks.append(current)
+            current, size = [], 8
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append(current)
+    return chunks or [[]]
+
+
+def split_text(text, limit=TELEGRAM_CHUNK):
+    if len(text) <= limit:
+        return [text]
+    return [text[i:i+limit] for i in range(0, len(text), limit)]
+
+
+def file_size_text(n):
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+def protocol_counts(links):
+    result = {}
+    for link in links:
+        p = link.split("://", 1)[0].lower()
+        result[p] = result.get(p, 0) + 1
+    return result
+
+
+def cleanup_job(user_id):
+    job = USER_JOBS.pop(user_id, None)
+    if job and job.get("directory"):
+        shutil.rmtree(job["directory"], ignore_errors=True)
+
+
+def maintenance_on():
+    return DB.setting("maintenance", "0") == "1"
+
+
+def admin_only(user_id):
+    return user_id == ADMIN_ID
+
 
 def sponsor_rows():
-    if not DB.conn:return []
-    rows=[]
-    for s in DB.conn.execute("SELECT * FROM sponsors WHERE active=1 ORDER BY sort_order,id").fetchall():
-        style_icon={'primary':'🔵','success':'🟢','danger':'🔴'}.get(s['style'],'🔵')
-        rows.append([InlineKeyboardButton(f"{style_icon} {s['button_text']}",url=s['url'])])
+    rows = []
+    for s in DB.sponsors(True):
+        style = s["style"] if s["style"] in {"primary", "success", "danger"} else "primary"
+        rows.append([
+            InlineKeyboardButton(
+                s["button_text"], url=s["url"], style=style
+            )
+        ])
     return rows
 
-def user_menu():
-    rows=[[InlineKeyboardButton("📤 ارسال فایل",callback_data="user:upload")],[InlineKeyboardButton("📊 سهمیه من",callback_data="user:quota"),InlineKeyboardButton("ℹ️ راهنما",callback_data="user:help")]]
-    rows+=sponsor_rows(); return kb(rows)
 
-def result_menu(uid):
-    j=JOBS.get(uid,{}); fmt=j.get('format_key'); rows=[]
-    if fmt:
-        if j.get('uris') and DB.feature_enabled(fmt,'uri'):rows.append([InlineKeyboardButton("🔗 URI",callback_data=f"result:uri:{uid}")])
-        if j.get('xray') and DB.feature_enabled(fmt,'json'):rows.append([InlineKeyboardButton("📋 JSON / Xray",callback_data=f"result:json:{uid}")])
-        if DB.feature_enabled(fmt,'original') and j.get('original'):rows.append([InlineKeyboardButton("📄 فایل اصلی",callback_data=f"result:original:{uid}")])
-    rows.append([InlineKeyboardButton("🗑 حذف نتیجه",callback_data=f"result:delete:{uid}")]); rows+=sponsor_rows(); return kb(rows)
+# ============================================================
+# Keyboards
+# ============================================================
+
+def user_menu():
+    rows = [
+        [
+            InlineKeyboardButton("📤 ارسال فایل", callback_data="menu:upload", style="primary"),
+            InlineKeyboardButton("🔗 ارسال لینک", callback_data="menu:link", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("📊 سهمیه من", callback_data="menu:quota", style="success"),
+            InlineKeyboardButton("ℹ️ راهنما", callback_data="menu:help", style="primary"),
+        ],
+    ]
+    rows.extend(sponsor_rows())
+    return InlineKeyboardMarkup(rows)
+
+
+def result_menu(user_id):
+    job=USER_JOBS.get(user_id,{})
+    ext=job.get("extension",Path(job.get("input_filename","")).suffix.lower())
+    rows=[]
+    if job.get("links") and feature_enabled(ext,"links"):
+        rows.append([InlineKeyboardButton("🔗 لینک‌ها",callback_data=f"result:links:{user_id}",style="success")])
+    if job.get("xray_configs") and feature_enabled(ext,"json"):
+        rows.append([InlineKeyboardButton("📋 JSON / Xray",callback_data=f"result:json:{user_id}",style="primary")])
+    if job.get("keys") and feature_enabled(ext,"keys"):
+        rows.append([InlineKeyboardButton("🔑 کلیدها",callback_data=f"result:keys:{user_id}",style="primary")])
+    if feature_enabled(ext,"info"):
+        rows.append([InlineKeyboardButton("🔍 اطلاعات",callback_data=f"result:info:{user_id}",style="primary")])
+    if job.get("original_file") and feature_enabled(ext,"original"):
+        rows.append([InlineKeyboardButton("📄 فایل اصلی",callback_data=f"result:original:{user_id}",style="primary")])
+    rows.append([InlineKeyboardButton("🗑 حذف",callback_data=f"result:delete:{user_id}",style="danger")])
+    rows.extend(sponsor_rows())
+    return InlineKeyboardMarkup(rows)
+
 
 def admin_menu():
-    return kb([
-      [InlineKeyboardButton("📊 داشبورد",callback_data="admin:dashboard"),InlineKeyboardButton("🛠 وضعیت",callback_data="admin:status")],
-      [InlineKeyboardButton("⚙️ تنظیمات عمومی",callback_data="admin:general"),InlineKeyboardButton("📦 فرمت‌ها",callback_data="admin:formats")],
-      [InlineKeyboardButton("🧪 سلامت parserها",callback_data="admin:health"),InlineKeyboardButton("📈 آمار خطا",callback_data="admin:errors")],
-      [InlineKeyboardButton("👥 دسترسی ادمین",callback_data="admin:admins"),InlineKeyboardButton("🧾 فعالیت‌ها",callback_data="admin:jobs")],
-      [InlineKeyboardButton("💾 دیتابیس",callback_data="admin:database"),InlineKeyboardButton("📜 لاگ اخیر",callback_data="admin:logs")],
-      [InlineKeyboardButton("🔄 reload settings",callback_data="admin:reload"),InlineKeyboardButton("♻️ reset settings",callback_data="admin:reset")],
-      [InlineKeyboardButton("📣 پیام همگانی",callback_data="admin:broadcast"),InlineKeyboardButton("🤝 اسپانسرها",callback_data="admin:sponsors")],
-      [InlineKeyboardButton("🔒 عضویت اجباری",callback_data="admin:channels"),InlineKeyboardButton("📜 changelog / version",callback_data="admin:version")],
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 داشبورد", callback_data="admin:dashboard", style="primary"),
+            InlineKeyboardButton("👥 کاربران", callback_data="admin:users:0", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ سهمیه و محدودیت", callback_data="admin:limits", style="primary"),
+            InlineKeyboardButton("📣 پیام همگانی", callback_data="admin:broadcast", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🤝 اسپانسرها", callback_data="admin:sponsors", style="primary"),
+            InlineKeyboardButton("🧾 فعالیت‌ها", callback_data="admin:jobs", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("🛠 وضعیت سرویس", callback_data="admin:status", style="success"),
+            InlineKeyboardButton("⚙️ تنظیمات", callback_data="admin:settings", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("💾 دیتابیس", callback_data="admin:database", style="primary"),
+            InlineKeyboardButton("📜 لاگ ۵ دقیقه اخیر", callback_data="admin:logs", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ لاگ کامل موتور", callback_data="admin:engine_logs", style="primary"),
+        ],
+        [InlineKeyboardButton("📦 مدیریت فرمت‌های اپ", callback_data="admin:app_formats", style="primary")],
+        [InlineKeyboardButton("🔒 عضویت اجباری", callback_data="admin:channels", style="primary")],
     ])
 
-def format_menu():
-    rows=[]
-    for f,name in FORMATS.items():
-        ready = f!='npvt' or bool(os.getenv('NPVT_WHITEBOX_B64','').strip())
-        state='🟢' if DB.fmt_enabled(f) and ready else '⚪'
-        rows.append([InlineKeyboardButton(f"{state} {name}",callback_data=f"admin:fmt:{f}")])
-    rows.append([InlineKeyboardButton("🔙 پنل",callback_data="admin:dashboard")]); return kb(rows)
 
-def format_settings_menu(fmt):
-    rows=[]
-    for f in FEATURES:
-        on=DB.feature_enabled(fmt,f) if f!='decrypt' else DB.get(f'format_{fmt}_decrypt','0')=='1' and DB.fmt_enabled(fmt)
-        label={'decrypt':'🔐 decrypt','uri':'🔗 URI','json':'📋 JSON','original':'📄 فایل اصلی'}[f]
-        rows.append([InlineKeyboardButton(f"{'🟢' if on else '⚪'} {label}",callback_data=f"admin:toggle:{fmt}:{f}")])
-    rows.append([InlineKeyboardButton("🔙 فرمت‌ها",callback_data="admin:formats")]); return kb(rows)
+# ============================================================
+# Access / start
+# ============================================================
+
+async def check_force_join(context, user_id):
+    channels = DB.channels(True)
+    missing = []
+    for ch in channels:
+        try:
+            member = await context.bot.get_chat_member(ch["chat_id"], user_id)
+            status = getattr(member, "status", "")
+            if status not in {"creator", "administrator", "member"} and not (status == "restricted" and getattr(member, "is_member", False)):
+                missing.append(ch)
+        except Exception as exc:
+            log.warning("force-join check failed for %s: %s", ch["chat_id"], exc)
+            missing.append(ch)
+    return missing
+
+def join_keyboard(channels):
+    rows = []
+    for ch in channels:
+        url = ch["invite_url"] or (f"https://t.me/{ch['username'].lstrip('@')}" if ch["username"] else "")
+        if url:
+            rows.append([InlineKeyboardButton(f"📢 {ch['title'] or ch['username'] or ch['chat_id']}", url=url, style="primary")])
+    rows.append([InlineKeyboardButton("✅ عضو شدم — بررسی", callback_data="access:check_join", style="success")])
+    return InlineKeyboardMarkup(rows)
+
+async def require_join(update, context):
+    if update.effective_user.id == ADMIN_ID:
+        return True
+    missing = await check_force_join(context, update.effective_user.id)
+    if not missing:
+        return True
+    target = update.callback_query.message if update.callback_query else update.message
+    text = "🔒 <b>برای استفاده از بات باید در کانال‌های زیر عضو باشی.</b>\n\nبعد از عضویت، روی «عضو شدم — بررسی» بزن."
+    await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=join_keyboard(missing))
+    return False
+
+def new_captcha():
+    a, b = secrets.randbelow(40) + 1, secrets.randbelow(40) + 1
+    return a, b, a + b
+
+async def ask_captcha(update, context, force=False):
+    uid = update.effective_user.id
+    verified, ops, failures = DB.captcha_state(uid)
+    interval = max(1, int(DB.setting("captcha_interval", "10")))
+    if not force and verified and ops < interval:
+        return True
+    a, b, answer = new_captcha()
+    msg = update.callback_query.message if update.callback_query else update.message
+    sent = await msg.reply_text(f"🤖 <b>برای ادامه، ثابت کن ربات نیستی.</b>\n\n<b>{a} + {b} = ؟</b>\n\nحداکثر ۵ تلاش داری.", parse_mode=ParseMode.HTML)
+    CAPTCHA_PENDING[uid] = {"answer": answer, "question_id": sent.message_id}
+    return False
+
+async def access_guard(update, context, require_captcha=True):
+    if not await guard(update):
+        return False
+    if not await require_join(update, context):
+        return False
+    if require_captcha and update.effective_user.id != ADMIN_ID:
+        if not await ask_captcha(update, context):
+            return False
+    return True
 
 async def guard(update):
-    u=update.effective_user
-    if not u:return False
-    DB.upsert_user(u); row=DB.user(u.id)
-    if row and row['is_blocked'] and not is_admin(u.id):
-        if update.callback_query: await update.callback_query.answer("دسترسی شما مسدود است.",show_alert=True)
-        elif update.message: await update.message.reply_text("⛔ دسترسی شما مسدود است.")
+    user = update.effective_user
+    if not user:
+        return False
+
+    DB.upsert_user(user)
+    row = DB.get_user(user.id)
+    if row and row["is_blocked"] and user.id != ADMIN_ID:
+        if update.callback_query:
+            await update.callback_query.answer("دسترسی شما مسدود است.", show_alert=True)
+        elif update.message:
+            await update.message.reply_text("⛔ دسترسی شما به بات مسدود شده است.")
         return False
     return True
 
-async def force_join(update,context):
-    if is_admin(update.effective_user.id):return True
-    missing=[]
-    for c in DB.conn.execute("SELECT * FROM force_join_channels WHERE active=1 ORDER BY id").fetchall():
+
+async def start(update, context):
+    if not await guard(update):
+        return
+
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        if not await require_join(update, context):
+            return
+        if not await ask_captcha(update, context):
+            return
+
+    if maintenance_on() and uid != ADMIN_ID:
+        await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
+        return
+
+    limit = int(DB.setting("daily_limit", "5"))
+    await update.message.reply_text(
+        "✨ <b>Star Decryptor</b> <code>v" + APP_VERSION + "</code>\n\n"
+        "فایل کانفیگ یا لینک خودت را ارسال کن.\n\n"
+        f"📅 سهمیه امروز: <b>{'∞' if limit == 0 else limit}</b> فایل",
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_menu(),
+    )
+
+
+async def help_command(update, context):
+    if not await guard(update): return
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        if not await require_join(update, context): return
+        if not await ask_captcha(update, context): return
+    await update.message.reply_text(
+        "ℹ️ <b>راهنمای کامل و ساده Star Decryptor</b>\n\n"
+        "📤 <b>ارسال فایل</b>\nبرای فایل‌های واقعی کانفیگ استفاده کن: <code>SLIP</code>، <code>EHI</code>، <code>DARK</code>، <code>HAT</code>، <code>NPVT</code>، <code>NPVS</code>، <code>NM</code> و <code>HAPP</code>.\n\n"
+        "🔗 <b>ارسال لینک/متن</b>\nبرای وقتی است که لینک یا کلید را به‌صورت متن داری؛ بات موارد قابل شناسایی را جدا می‌کند.\n\n"
+        "🌐 <b>موارد قابل شناسایی</b>\nVLESS، VMess، Trojan، Shadowsocks، SOCKS، Hysteria، Hysteria2، TUIC، WireGuard و SSH.\n\n"
+        "🔑 <b>کلیدها</b>\nفرمت‌های مختلف کلید مثل <code>Key:</code>، <code>AppKey:</code>، <code>ConfigKey:</code> و کلیدهای مشابه بررسی می‌شوند.\n\n"
+        "📋 <b>بعد از پردازش</b>\n«لینک‌ها» فقط موارد قابل استخراج را می‌دهد، «JSON» نتیجه ساختاریافته را می‌دهد، «اطلاعات» خلاصه نتیجه را نشان می‌دهد و «خروجی» فایل کامل پردازش‌شده را می‌فرستد.\n\n"
+        "📦 <b>تعداد زیاد</b>\nاگر تعداد لینک‌ها زیاد باشد، خودکار در چند پیام تقسیم می‌شوند و هر پیام جداگانه قابل کپی است.\n\n"
+        "🔐 <b>فایل رمزدار</b>\nاگر فایل به رمز خارجی نیاز داشته باشد، بدون کلید یا رمز لازم قابل باز کردن نیست.\n\n"
+        "🆘 <b>دستورها</b>\n<code>/start</code> شروع کار\n<code>/help</code> راهنما\n<code>/cancel</code> لغو عملیات جاری",
+        parse_mode=ParseMode.HTML, reply_markup=user_menu())
+
+
+async def cancel(update, context):
+    uid = update.effective_user.id
+    if uid == ADMIN_ID:
+        ADMIN_STATE.pop(ADMIN_ID, None)
+    cleanup_job(uid)
+    await update.message.reply_text(
+        "❎ عملیات لغو شد.",
+        reply_markup=admin_menu() if uid == ADMIN_ID else user_menu(),
+    )
+
+
+# ============================================================
+# User menu callback
+# ============================================================
+
+async def access_callback(update, context):
+    q = update.callback_query
+    uid = q.from_user.id
+    if q.data == "access:check_join":
+        await q.answer()
+        if not await require_join(update, context):
+            return
+        await q.message.reply_text("✅ عضویت تأیید شد. حالا می‌توانی از بات استفاده کنی.", reply_markup=user_menu())
+
+async def handle_captcha_answer(update, context):
+    uid = update.effective_user.id
+    if not await require_join(update, context):
+        return
+    pending = CAPTCHA_PENDING.pop(uid, None)
+    if not pending:
+        return
+    answer_msg = update.message
+    try:
+        await context.bot.delete_message(uid, pending["question_id"])
+    except Exception:
+        pass
+    try:
+        await answer_msg.delete()
+    except Exception:
+        pass
+    try:
+        answer = int((answer_msg.text or "").strip())
+    except Exception:
+        answer = None
+    if answer == pending["answer"]:
+        DB.set_captcha_verified(uid, True)
+        await context.bot.send_message(uid, "✅ تأیید شد. حالا می‌توانی ادامه بدهی.", reply_markup=user_menu())
+        return
+    failures = DB.captcha_fail(uid)
+    max_attempts = max(1, int(DB.setting("captcha_max_attempts", "5")))
+    if failures >= max_attempts:
+        DB.set_blocked(uid, True)
+        u = DB.get_user(uid)
+        name = " ".join(x for x in [u["first_name"], u["last_name"]] if x)
+        username = "@" + u["username"] if u["username"] else "ندارد"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🟢 رفع مسدودیت", callback_data=f"admin:user:unblock:{uid}", style="success")]])
         try:
-            m=await context.bot.get_chat_member(c['chat_id'],update.effective_user.id)
-            if getattr(m,'status','') not in {'creator','administrator','member'} and not (getattr(m,'status','')=='restricted' and getattr(m,'is_member',False)):missing.append(c)
-        except Exception:missing.append(c)
-    if not missing:return True
-    rows=[]
-    for c in missing:
-        url=c['invite_url'] or (f"https://t.me/{c['username'].lstrip('@')}" if c['username'] else '')
-        if url:rows.append([InlineKeyboardButton(f"📢 {c['title'] or c['username'] or c['chat_id']}",url=url)])
-    rows.append([InlineKeyboardButton("✅ عضو شدم — بررسی",callback_data="access:join")])
-    target=update.callback_query.message if update.callback_query else update.message
-    await target.reply_text("🔒 برای استفاده باید در کانال‌های فعال عضو باشی.",reply_markup=kb(rows)); return False
+            await context.bot.send_message(ADMIN_ID, f"⛔ <b>کاربر به‌دلیل ۵ پاسخ اشتباه مسدود شد.</b>\n\n🆔 <code>{uid}</code>\n👤 {esc(name or 'بدون نام')}\n🔹 {esc(username)}", parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception: pass
+        return
+    # The previous question and answer have already been deleted. Replace them
+    # with one fresh challenge without leaving extra captcha messages behind.
+    a,b,ans = new_captcha()
+    sent = await context.bot.send_message(uid, f"🤖 <b>{a} + {b} = ؟</b>", parse_mode=ParseMode.HTML)
+    CAPTCHA_PENDING[uid] = {"answer": ans, "question_id": sent.message_id}
 
-def captcha_question():
-    a=secrets.randbelow(40)+1;b=secrets.randbelow(40)+1;return a,b,a+b
-async def captcha_guard(update,context):
-    if is_admin(update.effective_user.id):return True
-    uid=update.effective_user.id; verified,ops,fail=bool(DB.user(uid)['captcha_verified']),int(DB.user(uid)['captcha_ops']),int(DB.user(uid)['captcha_failures'])
-    interval=max(1,int(DB.get('captcha_interval','10')))
-    if verified and ops<interval:return True
-    a,b,ans=captcha_question(); msg=update.callback_query.message if update.callback_query else update.message; sent=await msg.reply_text(f"🤖 {a} + {b} = ؟")
-    CAPTCHA[uid]={'answer':ans,'message_id':sent.message_id}; return False
+async def menu_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not await guard(update):
+        return
+    uid = q.from_user.id
+    if uid != ADMIN_ID and not await require_join(update, context):
+        return
 
-async def start(update,context):
-    if not await guard(update) or not await force_join(update,context):return
-    if not await captcha_guard(update,context):return
-    if DB.get('maintenance','0')=='1' and not is_admin(update.effective_user.id):await update.message.reply_text("🛠 سرویس موقتاً در دسترس نیست.");return
-    lim=int(DB.get('daily_limit','5')); await update.message.reply_text(f"✨ <b>{APP_NAME}</b> <code>v{VERSION}</code>\n\nفقط فایل کانفیگ را ارسال کن.\nسهمیه امروز: <b>{'∞' if lim==0 else lim}</b> فایل",parse_mode=ParseMode.HTML,reply_markup=user_menu())
+    if q.data == "menu:upload":
+        await q.message.reply_text(
+            "📤 فایل را مستقیم ارسال کن.\n\n"
+            f"فرمت‌های فعال: {', '.join(app_format_label(x) for x in enabled_app_formats()) or 'هیچ‌کدام'}.",
+            reply_markup=back_button("menu:help"),
+        )
+    elif q.data == "menu:link":
+        await q.message.reply_text("🔗 لینک یا متن را همینجا ارسال کن.", reply_markup=back_button("menu:help"))
+    elif q.data == "menu:quota":
+        limit = int(DB.setting("daily_limit", "5"))
+        used = DB.daily_usage(uid)
+        text = (
+            "📊 <b>سهمیه امروز</b>\n\n"
+            f"مصرف‌شده: <b>{used}</b>\n"
+            f"سقف: <b>{'∞' if limit == 0 else limit}</b>"
+        )
+        await q.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=user_menu()
+        )
+    elif q.data == "menu:help":
+        await q.message.reply_text(
+            "ℹ️ <b>راهنما</b>\n\n"
+            "• بخش «ارسال فایل»: برای پردازش و رمزگشایی خودکار فایل‌های پشتیبانی‌شده است.\n"
+            "• بخش «ارسال لینک»: برای شناسایی و استخراج لینک‌های کانفیگ از متن است.\n"
+            "• رمز از کاربر دریافت نمی‌شود؛ پردازش به‌صورت غیرتعاملی انجام می‌شود.\n"
+            "• اگر فایل کلید داخلی داشته باشد، خودکار پردازش می‌شود. فایل‌هایی که واقعاً به رمز بیرونی نیاز دارند بدون آن رمز قابل بازشدن نیستند.\n"
+            "• بعد از پردازش می‌توانی لینک‌ها، JSON، اطلاعات یا خروجی را بگیری.\n"
+            "• در بخش لینک‌ها هر خط فقط یک لینک است.\n"
+            f"• فرمت‌های فعال: {', '.join(x.lstrip('.') for x in enabled_app_formats()) or 'هیچ‌کدام'}.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_menu(),
+        )
 
-async def help_cmd(update,context):
-    if not await guard(update) or not await force_join(update,context) or not await captcha_guard(update,context):return
-    await update.message.reply_text("ℹ️ <b>راهنما</b>\n\nفقط فایل دریافت می‌شود. فرمت پس از بررسی ساختار واقعی فایل تشخیص داده می‌شود.\nاگر decrypt یا خروجی خاصی خاموش باشد، همان مرحله اجرا یا نمایش داده نمی‌شود.\nفایل خراب یا غیرقابل‌اعتبارسنجی هرگز موفق گزارش نمی‌شود.",parse_mode=ParseMode.HTML,reply_markup=user_menu())
 
-async def cancel(update,context):
-    uid=update.effective_user.id; CAPTCHA.pop(uid,None); ADMIN_STATE.pop(uid,None); cleanup(uid); await update.message.reply_text("❎ عملیات لغو شد.",reply_markup=admin_menu() if is_admin(uid) else user_menu())
+# ============================================================
+# Direct text / link
+# ============================================================
 
-def cleanup(uid):
-    j=JOBS.pop(uid,None)
-    if j and j.get('directory'):shutil.rmtree(j['directory'],ignore_errors=True)
+async def handle_text(update, context):
+    if not await guard(update):
+        return
 
-async def handle_captcha(update,context):
-    uid=update.effective_user.id; p=CAPTCHA.pop(uid,None)
-    if not p:return False
+    uid = update.effective_user.id
+
+    if uid != ADMIN_ID and uid in CAPTCHA_PENDING:
+        await handle_captcha_answer(update, context)
+        return
+    if uid in USER_JOBS and USER_JOBS[uid].get("pending_password"):
+        await handle_password(update, context)
+        return
+
+    if not await require_join(update, context):
+        return
+
+    if uid == ADMIN_ID and uid in ADMIN_STATE:
+        await handle_admin_state(update, context)
+        return
+
+    if uid != ADMIN_ID and not await ask_captcha(update, context):
+        return
+
+    if maintenance_on() and uid != ADMIN_ID:
+        await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
+        return
+
+    links = extract_links(update.message.text or "")
+    if not links:
+        links = extract_structured_uris(update.message.text or "")
+    if not links:
+        await update.message.reply_text(
+            "❌ لینک قابل شناسایی پیدا نشد.",
+            reply_markup=user_menu(),
+        )
+        return
+
+    cleanup_job(uid)
+    USER_JOBS[uid] = {
+        "directory": None,
+        "extension": "",
+        "raw": update.message.text,
+        "links": links,
+        "source_files": ["پیام"],
+        "keys": extract_labeled_keys(update.message.text or ""),
+        "json_values": json_objects_from_text(update.message.text or ""),
+        "xray_configs": [],
+        "files": [],
+        "protocol_counts": protocol_counts(links),
+    }
+    if uid != ADMIN_ID:
+        DB.captcha_increment_ops(uid)
+
+    await update.message.reply_text(
+        f"✅ <b>{len(links)}</b> لینک شناسایی شد.\n\nانتخاب کن:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=result_menu(uid),
+    )
+
+
+# ============================================================
+# Engine
+# ============================================================
+
+async def run_engine(input_dir, output_dir, password=None):
+    """Run Pantegnos completely non-interactively and wait for its real exit.
+
+    We intentionally do NOT terminate the process as soon as the first output
+    file appears: some Pantegnos modules can create one file and then continue
+    writing other outputs. Waiting for process completion prevents partial
+    results from being presented to the user.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timeout = max(10, int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT))))
+    if not PANTEGNOS_BIN:
+        # DECRYPTION_SCRIPTS projects are script based. Configure runner in compose.
+        # Example: python /opt/DECRYPTION_SCRIPTS/decrypt.py
+        raise FileNotFoundError("DECRYPTION_RUNNER is not configured")
+    command = PANTEGNOS_BIN.split() + [str(input_dir), str(output_dir)]
+    job_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    log.info("engine start input=%s output=%s interactive_password=%s", input_dir, output_dir, bool(password))
+    async with JOB_SEMAPHORE:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE if password is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(input_dir.parent),
+            )
+        except FileNotFoundError as exc:
+            log.exception("engine executable not found: %s", PANTEGNOS_BIN)
+            raise RuntimeError("موتور پردازش روی سرور در دسترس نیست.") from exc
+        try:
+            payload = ((str(password) + "\n").encode("utf-8") if password is not None else None)
+            out, err = await asyncio.wait_for(proc.communicate(input=payload), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                out, err = await proc.communicate()
+            except Exception:
+                out, err = b"", b""
+            log.error("engine timeout after %ss", timeout)
+            raise RuntimeError("زمان پردازش فایل تمام شد.") from exc
+
+    stdout = out.decode("utf-8", errors="replace")
+    stderr = err.decode("utf-8", errors="replace")
+    rc = proc.returncode
+
     try:
-        ok=int((update.message.text or '').strip())==p['answer']
-    except:ok=False
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with ENGINE_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + "=" * 90 + "\n")
+            fh.write(f"[{job_stamp}] rc={rc}\n")
+            fh.write(f"input={input_dir}\noutput={output_dir}\n")
+            fh.write("--- STDOUT ---\n")
+            fh.write(stdout if stdout else "<empty>\n")
+            fh.write("--- STDERR ---\n")
+            fh.write(stderr if stderr else "<empty>\n")
+    except Exception:
+        log.exception("could not persist engine log")
+
+    log.info("engine finished rc=%s stdout=%d stderr=%d output_exists=%s", rc, len(stdout), len(stderr), output_exists(output_dir))
+    if stdout.strip():
+        log.info("engine stdout: %s", stdout[-12000:])
+    if stderr.strip():
+        log.warning("engine stderr: %s", stderr[-12000:])
+    return rc, stdout, stderr
+
+
+def output_text(output_dir):
+    parts, names = [], []
+    for path in sorted(p for p in output_dir.rglob("*") if p.is_file()):
+        if not is_probably_text(path) or path.stat().st_size > 5 * 1024 * 1024:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        names.append(path.relative_to(output_dir).as_posix())
+        parts.append(f"===== {path.relative_to(output_dir).as_posix()} =====\n{text}\n")
+    return "\n".join(parts), names
+
+
+def output_exists(output_dir):
+    return any(p.is_file() for p in output_dir.rglob("*"))
+
+
+def password_prompt_detected(stdout, stderr):
+    text = (stdout + "\n" + stderr).lower()
+    return any(x in text for x in (
+        "enter password", "enter passkey", "enter passphrase",
+        "password:", "passkey:", "passphrase:",
+        "passphrase required to open this config",
+        "this config is passphrase-protected",
+    ))
+
+
+def engine_failure_reason(rc, stdout, stderr, ext=""):
+    """Return a precise engine-facing reason without asking the Telegram user for a password."""
+    text = strip_ansi((stdout or "") + "\n" + (stderr or "")).strip()
+    low = text.lower()
+    if any(x in low for x in ("incorrect passphrase", "passphrase required", "passphrase-protected", "enter passphrase")):
+        for line in reversed(text.splitlines()):
+            if any(x in line.lower() for x in ("passphrase", "password", "passkey")):
+                return f"🔐 {line.strip()[:900]}"
+        return "🔐 این فایل به Passphrase خارجی نیاز دارد و موتور آن را بدون ورودی تعاملی باز نکرد."
+    if "bad magic" in low or "invalid format" in low or "no matching module" in low:
+        return "ساختار فایل با ماژول‌های فعلی Pantegnos سازگار نیست یا فایل ناقص است."
+    if rc != 0 and text:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line and not line.startswith("["):
+                return f"خطای موتور: {line[:900]}"
+        return "پردازش فایل توسط موتور با خطا متوقف شد."
+    return "فایل خراب، ناقص یا غیرقابل پردازش است."
+
+
+
+    files = sorted(p for p in output_dir.rglob("*") if p.is_file())
+    parts = []
+    names = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        names.append(path.name)
+        parts.append(f"===== {path.name} =====\n{text}\n")
+    return "\n".join(parts), names
+
+
+# ============================================================
+# File processing
+# ============================================================
+
+def result_summary_text(ext, links_count):
+    parts=["✅ <b>پردازش با موفقیت انجام شد.</b>", ""]
+    if feature_enabled(ext,"links"):
+        parts.append(f"🔗 URIهای قابل استخراج: <b>{links_count}</b>")
+    parts += ["", "گزینه‌های فعال را انتخاب کن:"]
+    return "\n".join(parts)
+
+
+async def handle_document(update, context):
+    if not await guard(update):
+        return
+
+    uid = update.effective_user.id
+
+    if uid == ADMIN_ID and ADMIN_STATE.get(ADMIN_ID, {}).get("type") in {"db_replace", "channel"}:
+        await handle_admin_state(update, context)
+        return
+
+    if uid != ADMIN_ID and uid in CAPTCHA_PENDING:
+        await update.message.reply_text("🤖 ابتدا پاسخ سؤال امنیتی را ارسال کن.")
+        return
+
+    if not await require_join(update, context):
+        return
+
+    if uid != ADMIN_ID and not await ask_captcha(update, context):
+        return
+
+    if maintenance_on() and uid != ADMIN_ID:
+        await update.message.reply_text("🛠 بات موقتاً در حال بروزرسانی است.")
+        return
+
+    doc = update.message.document
+    filename = Path(doc.file_name or "config.bin").name
+    ext = Path(filename).suffix.lower()
+    max_size = int(DB.setting("max_file_size", str(DEFAULT_MAX_FILE_SIZE)))
+
+    if doc.file_size and doc.file_size > max_size:
+        await update.message.reply_text(
+            f"❌ حجم فایل بیشتر از حد مجاز است.\nحداکثر: {file_size_text(max_size)}"
+        )
+        return
+
+    # Plain text/JSON config files: extract links without invoking the engine.
+    if ext in {".txt", ".json", ".conf", ".log"}:
+        path = Path(tempfile.mkstemp(prefix="pd-", suffix=ext)[1])
+        try:
+            tg = await doc.get_file()
+            await tg.download_to_drive(custom_path=str(path))
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            json_values = json_objects_from_text(content)
+            profile_links, profile_configs = build_profile_outputs(json_values)
+            links = profile_links + [u for u in extract_links(content) if u not in set(profile_links)]
+            if not links:
+                links = extract_structured_uris(content)
+            if links:
+                cleanup_job(uid)
+                USER_JOBS[uid] = {
+                    "directory": None,
+                    "extension": ext,
+                    "input_filename": filename,
+                    "raw": content,
+                    "links": links,
+                    "keys": extract_labeled_keys(content),
+                    "json_values": json_values,
+                    "xray_configs": profile_configs or xray_configs_from_links(links),
+                    "files": [],
+                    "original_file": None,
+                    "protocol_counts": protocol_counts(links),
+                    "source_files": [filename],
+                }
+                await update.message.reply_text(
+                    f"✅ <b>{len(links)}</b> لینک پیدا شد.\n\nانتخاب کن:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=result_menu(uid),
+                )
+                return
+        finally:
+            path.unlink(missing_ok=True)
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        await update.message.reply_text("⚠️ این پسوند در موتور فعلی Star Decryptor ثبت نشده است.")
+        return
+    if not app_format_enabled(ext):
+        await update.message.reply_text(f"⛔ فرمت {esc(app_format_label(ext))} فعلاً توسط مدیر غیرفعال شده است.", parse_mode=ParseMode.HTML)
+        return
+
+    if not DB.consume_daily(uid):
+        limit = int(DB.setting("daily_limit", "5"))
+        await update.message.reply_text(
+            f"⛔ سهمیه امروزت تمام شده است.\nسقف روزانه: {limit} فایل"
+        )
+        return
+
+    work_dir = Path(tempfile.mkdtemp(prefix="prodecryptor-"))
+    input_dir = work_dir / "configs"
+    output_dir = work_dir / "output"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_file = input_dir / filename
+
+    job_id = uuid.uuid4().hex
+    DB.create_job(job_id, uid, filename, ext)
+
+    status = await update.message.reply_text(
+        "⏳ <b>فایل دریافت شد.</b>\nدر حال آماده‌سازی...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        tg = await doc.get_file()
+        await tg.download_to_drive(custom_path=str(input_file))
+
+        if input_file.stat().st_size > max_size:
+            raise RuntimeError("حجم فایل بیش از حد مجاز است.")
+
+        await status.edit_text(
+            "⚙️ <b>در حال پردازش...</b>\nلطفاً صبر کن.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        rc, stdout, stderr = await run_engine(input_dir, output_dir)
+
+        # A produced output is authoritative even when the process return code is non-zero.
+        if not output_exists(output_dir):
+            if password_prompt_detected(stdout, stderr):
+                USER_JOBS[uid] = {"directory": str(work_dir), "input_dir": str(input_dir), "output_dir": str(output_dir), "input_filename": filename, "extension": ext, "pending_password": True, "job_id": job_id, "links": [], "keys": [], "json_values": [], "xray_configs": [], "files": [], "raw": "", "stdout": "", "stderr": "", "original_file": str(input_file)}
+                DB.finish_job(job_id, "password_required", 0, "password required")
+                await status.edit_text("🔐 <b>این فایل رمز دارد.</b>\n\nرمز فایل را در پیام بعدی ارسال کن.\nبرای لغو: /cancel", parse_mode=ParseMode.HTML)
+                return
+            raise RuntimeError(engine_failure_reason(rc, stdout, stderr, ext))
+
+        analysis = analyze_engine_output(output_dir, stdout, stderr, filename)
+        if not analysis["links"] and not analysis["xray_configs"] and not analysis["keys"]:
+            raise RuntimeError("خروجی معتبری از موتور دریافت نشد.")
+        log.info("engine analysis: links=%d json=%d keys=%d", len(analysis["links"]), len(analysis["json_values"]), len(analysis["keys"]))
+
+        USER_JOBS[uid] = {
+            "directory": str(work_dir),
+            "extension": ext,
+            "input_filename": filename,
+            "raw": "",
+            "stdout": "",
+            "stderr": "",
+            "links": analysis["links"],
+            "keys": analysis["keys"],
+            "json_values": analysis["json_values"],
+            "xray_configs": analysis.get("xray_configs", []),
+            "files": [],
+            "original_file": str(input_file),
+            "source_files": [filename],
+            "protocol_counts": analysis["protocol_counts"],
+            "job_id": job_id,
+        }
+
+        DB.record_success(uid, len(analysis["links"]))
+        if uid != ADMIN_ID:
+            DB.captcha_increment_ops(uid)
+        DB.finish_job(job_id, "success", len(analysis["links"]))
+
+        await status.edit_text(
+            f"📄 فایل: <code>{esc(filename)}</code>\n\n" + result_summary_text(ext, len(analysis["links"])),
+            parse_mode=ParseMode.HTML,
+            reply_markup=result_menu(uid),
+        )
+
+    except Exception as exc:
+        log.exception("file processing failed user=%s file=%s", uid, filename)
+        DB.record_failure(uid)
+        DB.finish_job(job_id, "failed", 0, str(exc)[:500])
+        DB.refund_daily(uid)
+        cleanup_job(uid)
+
+        await status.edit_text(
+            "❌ <b>پردازش فایل ناموفق بود.</b>\n\n"
+            "فایل ممکن است خراب، ناقص، رمز اشتباه یا غیرقابل پردازش باشد.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def handle_password(update,context):
+    uid=update.effective_user.id;job=USER_JOBS.get(uid)
+    if not job or not job.get("pending_password"):return
+    password=update.message.text or ""
+    if not password:return
     try:await update.message.delete()
-    except:pass
-    if ok:
-        DB.conn.execute("UPDATE users SET captcha_verified=1,captcha_ops=0,captcha_failures=0 WHERE user_id=?",(uid,));DB.conn.commit();await context.bot.send_message(uid,"✅ تأیید شد.",reply_markup=user_menu())
-    else:
-        DB.conn.execute("UPDATE users SET captcha_failures=captcha_failures+1 WHERE user_id=?",(uid,));DB.conn.commit();
-        if int(DB.user(uid)['captcha_failures'])>=int(DB.get('captcha_max_attempts','5')):DB.conn.execute("UPDATE users SET is_blocked=1 WHERE user_id=?",(uid,));DB.conn.commit();await context.bot.send_message(uid,"⛔ دسترسی شما به‌دلیل تلاش‌های ناموفق مسدود شد.")
-        else:
-            a,b,ans=captcha_question();sent=await context.bot.send_message(uid,f"🤖 {a} + {b} = ؟");CAPTCHA[uid]={'answer':ans,'message_id':sent.message_id}
-    return True
-
-async def handle_document(update,context):
-    if not await guard(update):return
-    uid=update.effective_user.id
-    if uid!=DEFAULT_ADMIN_ID and uid in CAPTCHA:
-        await update.message.reply_text("🤖 ابتدا سؤال امنیتی را پاسخ بده.");return
-    if not await force_join(update,context) or not await captcha_guard(update,context):return
-    if DB.get('maintenance','0')=='1' and not is_admin(uid):await update.message.reply_text("🛠 سرویس موقتاً در دسترس نیست.");return
-    doc=update.message.document; name=Path(doc.file_name or 'config.bin').name; size_limit=int(DB.get('max_file_size',str(50*1024*1024)))
-    if doc.file_size and doc.file_size>size_limit:await update.message.reply_text(f"❌ حجم فایل بیشتر از حد مجاز است: {size_limit//1024//1024} MB");return
-    if not DB.consume(uid):await update.message.reply_text(f"⛔ سهمیه امروز تمام شده است. سقف: {DB.get('daily_limit','5')}");return
-    m=detect(await _download_bytes(doc),name)
-    if not m:
-        DB.refund(uid); await update.message.reply_text("❌ فرمت فایل قابل تشخیص نیست.");return
-    if not DB.fmt_enabled(m.key):
-        DB.refund(uid); await update.message.reply_text("⛔ این فرمت توسط مدیر غیرفعال شده است.");return
-    if DB.get(f'format_{m.key}_decrypt','0')!='1':
-        DB.refund(uid); await update.message.reply_text("⛔ decrypt این فرمت غیرفعال است.");return
-    data=await _download_bytes(doc); msg=await update.message.reply_text("⏳ در حال اعتبارسنجی و پردازش فایل...")
-    jid=uuid.uuid4().hex; DB.job(jid,uid,name,Path(name).suffix.lower())
+    except Exception:pass
+    status=await context.bot.send_message(uid,"🔐 در حال بررسی رمز فایل...")
+    output_dir=Path(job["output_dir"]);input_dir=Path(job["input_dir"])
     try:
-        async with LIMITER:
-            r=await asyncio.to_thread(process,data,name,set(FORMATS),int(DB.get('max_configs','100')),DB.get('validation','1')=='1',None,DB.feature_enabled(m.key,'uri'),DB.feature_enabled(m.key,'json'))
-        if r.errors:raise RuntimeError('; '.join(r.errors))
-        # deterministic duplicate filtering at the final artifact level
-        if DB.get('duplicate_filter','1')=='1':
-            r.uris=list(dict.fromkeys(r.uris));
-            seen=set(); uniq=[]
-            for c in r.xray:
-                k=json.dumps(c,ensure_ascii=False,sort_keys=True,separators=(',',':'))
-                if k not in seen:seen.add(k);uniq.append(c)
-            r.xray=uniq
-        if not r.uris and not r.xray and not DB.feature_enabled(m.key,'original'):raise RuntimeError('هیچ خروجی معتبر و فعال تولید نشد.')
-        work=Path(tempfile.mkdtemp(prefix='cfg-')); original=work/name; original.write_bytes(data)
-        JOBS[uid]={'directory':str(work),'format_key':m.key,'format_name':FORMATS[m.key],'filename':name,'uris':r.uris,'xray':r.xray,'original':str(original),'warnings':r.warnings,'reason':r.detected_reason}
-        DB.success(uid,len(r.uris));DB.finish(jid,'success',len(r.uris));
-        if not is_admin(uid):DB.conn.execute("UPDATE users SET captcha_ops=captcha_ops+1 WHERE user_id=?",(uid,));DB.conn.commit()
-        await msg.edit_text(f"✅ <b>پردازش موفق</b>\n\nفرمت: <b>{esc(FORMATS[m.key])}</b>\nنتایج معتبر: <b>{len(r.uris)+len(r.xray)}</b>",parse_mode=ParseMode.HTML,reply_markup=result_menu(uid))
-    except Exception as e:
-        DB.failure(uid);DB.finish(jid,'failed',0,str(e));DB.refund(uid);log.exception('processing failed')
-        await msg.edit_text(f"❌ <b>پردازش ناموفق</b>\n\n<code>{esc(str(e)[:1000])}</code>",parse_mode=ParseMode.HTML,reply_markup=user_menu())
+        shutil.rmtree(output_dir,ignore_errors=True);output_dir.mkdir(parents=True,exist_ok=True)
+        rc,stdout,stderr=await run_engine(input_dir,output_dir,password)
+        if password_prompt_detected(stdout,stderr) and not output_exists(output_dir):raise RuntimeError("wrong password")
+        if not output_exists(output_dir):raise RuntimeError(engine_failure_reason(rc,stdout,stderr,job.get("extension","")))
+        analysis=analyze_engine_output(output_dir,stdout,stderr,job.get("input_filename","config"))
+        if not analysis["links"] and not analysis["xray_configs"] and not analysis["keys"]:raise RuntimeError("empty output")
+        job.update({"pending_password":False,"raw":"","stdout":"","stderr":"","links":analysis["links"],"keys":analysis["keys"],"json_values":analysis["json_values"],"xray_configs":analysis["xray_configs"],"files":[],"source_files":[job.get("input_filename","config")],"protocol_counts":analysis["protocol_counts"]})
+        USER_JOBS[uid]=job;DB.record_success(uid,len(analysis["links"]));DB.finish_job(job["job_id"],"success",len(analysis["links"]))
+        if uid!=ADMIN_ID:DB.captcha_increment_ops(uid)
+        await status.edit_text(result_summary_text(job.get("extension",""), len(analysis["links"])),parse_mode=ParseMode.HTML,reply_markup=result_menu(uid))
+    except Exception as exc:
+        log.warning("password processing failed user=%s: %s",uid,exc)
+        await status.edit_text("❌ رمز صحیح نیست یا فایل قابل پردازش نیست.\n\n🔐 رمز را دوباره ارسال کن یا /cancel را بزن.",parse_mode=ParseMode.HTML)
 
-def _download_bytes_sync(doc):return None
-async def _download_bytes(doc):
-    f=await doc.get_file(); path=Path(tempfile.mkstemp(prefix='dl-')[1]); await f.download_to_drive(custom_path=str(path)); data=path.read_bytes();path.unlink(missing_ok=True);return data
+
+# ============================================================
+# Result callback
+# ============================================================
 
 async def result_callback(update,context):
-    q=update.callback_query;await q.answer();uid=q.from_user.id
-    if not await guard(update) or not await force_join(update,context):return
-    parts=q.data.split(':'); action=parts[1]; owner=int(parts[2])
-    if uid!=owner:await q.answer('این نتیجه متعلق به شما نیست.',show_alert=True);return
-    j=JOBS.get(uid)
-    if not j:await q.message.reply_text('⚠️ نتیجه دیگر در دسترس نیست.');return
-    fmt=j['format_key']
-    if action in {'uri','json','original'} and not DB.feature_enabled(fmt,action):await q.answer('این قابلیت غیرفعال است.',show_alert=True);return
-    if action=='uri':
-        for u in j['uris']:await q.message.reply_text(f"<code>{esc(u)}</code>",parse_mode=ParseMode.HTML)
-    elif action=='json':
-        for c in j['xray']:await q.message.reply_text(f"<pre>{esc(json.dumps(c,ensure_ascii=False,indent=2))}</pre>",parse_mode=ParseMode.HTML)
-    elif action=='original':
-        with open(j['original'],'rb') as f:await q.message.reply_document(f,filename=j['filename'])
-    elif action=='delete':cleanup(uid);await q.message.reply_text('🗑 نتیجه حذف شد.',reply_markup=user_menu());return
-    await q.message.reply_text('↩️',reply_markup=result_menu(uid))
+    q=update.callback_query;await q.answer()
+    if not await guard(update):return
+    if not await require_join(update,context):return
+    _,action,owner=q.data.split(":");owner=int(owner)
+    if q.from_user.id!=owner:await q.answer("این نتیجه متعلق به شما نیست.",show_alert=True);return
+    job=USER_JOBS.get(owner)
+    if not job:await q.message.reply_text("⚠️ نتیجه دیگر در دسترس نیست. فایل را دوباره ارسال کن.");return
+    ext=job.get("extension",Path(job.get("input_filename","")).suffix.lower())
+    if action!="delete" and not feature_enabled(ext,action):await q.answer("این قابلیت توسط مدیر غیرفعال شده است.",show_alert=True);return
+    links=job.get("links",[]);keys=job.get("keys",[]);configs=job.get("xray_configs",[])
+    if action=="links":
+        if not links:await q.message.reply_text("❌ لینک استانداردی پیدا نشد.",reply_markup=result_menu(owner));return
+        for chunk in split_link_chunks(links):await q.message.reply_text(links_codeblock(chunk),parse_mode=ParseMode.MARKDOWN)
+        await q.message.reply_text("🔗 پایان فهرست URIها",reply_markup=result_menu(owner));return
+    if action=="json":
+        if not configs:await q.message.reply_text("❌ JSON/Xray معتبر ساخته نشد.",reply_markup=result_menu(owner));return
+        for cfg in configs:
+            for chunk in split_text(json.dumps(cfg,ensure_ascii=False,separators=(",",":"))):await q.message.reply_text(f"<pre>{esc(chunk)}</pre>",parse_mode=ParseMode.HTML)
+            await q.message.reply_text("────────────",reply_markup=result_menu(owner))
+        return
+    if action=="keys":
+        if not keys:await q.message.reply_text("❌ کلید صریحی پیدا نشد.",reply_markup=result_menu(owner));return
+        for chunk in split_text("\n".join(f"{i+1}. {x}" for i,x in enumerate(keys))):await q.message.reply_text(f"<pre>{esc(chunk)}</pre>",parse_mode=ParseMode.HTML)
+        await q.message.reply_text("🔑 پایان کلیدها",reply_markup=result_menu(owner));return
+    if action=="info":
+        counts=job.get("protocol_counts",protocol_counts(links))
+        lines=["🔍 <b>اطلاعات نتیجه</b>","",f"🔗 URIهای معتبر: <b>{len(links)}</b>",f"🔑 کلیدهای صریح: <b>{len(keys)}</b>",f"🧩 JSONهای تشخیص‌داده‌شده: <b>{len(job.get('json_values',[]))}</b>"]
+        if counts:lines += ["","📡 <b>پروتکل‌های URI:</b>"]+[f"• <code>{esc(p)}</code>: {c}" for p,c in sorted(counts.items())]
+        await q.message.reply_text("\n".join(lines),parse_mode=ParseMode.HTML,reply_markup=result_menu(owner));return
+    if action=="original":
+        original=job.get("original_file")
+        if not original or not Path(original).exists():await q.message.reply_text("❌ فایل اصلی دیگر در دسترس نیست.",reply_markup=result_menu(owner));return
+        path=Path(original)
+        with path.open("rb") as fh:await q.message.reply_document(fh,filename=path.name,caption="📄 فایل اصلی با فرمت اصلی")
+        return
+    if action=="delete":cleanup_job(owner);await q.message.reply_text("🗑 نتیجه حذف شد.",reply_markup=user_menu());return
 
-async def user_callback(update,context):
-    q=update.callback_query;await q.answer();
-    if not await guard(update) or not await force_join(update,context):return
-    uid=q.from_user.id
-    if q.data=='user:upload':await q.message.reply_text('📤 فایل را مستقیم ارسال کن.',reply_markup=user_menu())
-    elif q.data=='user:quota':await q.message.reply_text(f"📊 مصرف امروز: <b>{DB.daily_usage(uid)}</b>\nسقف: <b>{'∞' if DB.get('daily_limit','5')=='0' else DB.get('daily_limit','5')}</b>",parse_mode=ParseMode.HTML,reply_markup=user_menu())
-    elif q.data=='user:help':await help_cmd(type('U',(),{'effective_user':q.from_user,'message':q.message,'callback_query':q})(),context)
-    elif q.data=='access:join':await force_join(update,context)
 
-async def admin_command(update,context):
-    if not is_admin(update.effective_user.id):return
-    await update.message.reply_text(f"🛡 <b>Admin</b> <code>v{VERSION}</code>",parse_mode=ParseMode.HTML,reply_markup=admin_menu())
+# ============================================================
+# Admin dashboard
+# ============================================================
 
-async def admin_callback(update,context):
-    q=update.callback_query;await q.answer();uid=q.from_user.id
-    if not is_admin(uid):return
-    d=q.data
-    if d=='admin:dashboard':await q.message.edit_text(f"📊 <b>داشبورد</b>\n\n{json.dumps(DB.stats(),ensure_ascii=False)}",parse_mode=ParseMode.HTML,reply_markup=admin_menu())
-    elif d=='admin:formats':await q.message.edit_text('📦 <b>فرمت‌ها</b>\n\nهر فرمت مستقل است.',parse_mode=ParseMode.HTML,reply_markup=format_menu())
-    elif d.startswith('admin:fmt:'):
-        f=d.split(':')[-1];await q.message.edit_text(f"🎛 <b>{esc(FORMATS[f])}</b>\n\nفعال بودن خود فرمت: {'🟢' if DB.fmt_enabled(f) else '⚪'}",parse_mode=ParseMode.HTML,reply_markup=kb([[InlineKeyboardButton(('🟢 فعال' if DB.fmt_enabled(f) else '⚪ غیرفعال'),callback_data=f'admin:fmt_toggle:{f}')]] + format_settings_menu(f).inline_keyboard))
-    elif d.startswith('admin:toggle:'):
-        _,_,f,feat=d.split(':'); key=f'format_{f}_{feat}'
-        if feat=='decrypt':DB.set(key,'0' if DB.get(key,'0')=='1' else '1')
-        else:DB.set(key,'0' if DB.get(key,'1')=='1' else '1')
-        await q.message.edit_text(f"🎛 <b>{esc(FORMATS[f])}</b>",parse_mode=ParseMode.HTML,reply_markup=format_settings_menu(f))
-    elif d.startswith('admin:fmt_toggle:'):
-        f=d.split(':')[-1]; DB.set(f'format_{f}','0' if DB.fmt_enabled(f) else '1'); await q.message.edit_text(f"🎛 <b>{esc(FORMATS[f])}</b>",parse_mode=ParseMode.HTML,reply_markup=kb([[InlineKeyboardButton(('🟢 فعال' if DB.fmt_enabled(f) else '⚪ غیرفعال'),callback_data=f'admin:fmt_toggle:{f}')]] + format_settings_menu(f).inline_keyboard))
-    elif d=='admin:broadcast':ADMIN_STATE[uid]={'type':'broadcast'};await q.message.reply_text('📣 متن پیام همگانی را ارسال کن.',reply_markup=back('admin:dashboard'))
-    elif d=='admin:sponsors':await admin_sponsors(q)
-    elif d.startswith('admin:sponsor:toggle:'):
-        sid=int(d.split(':')[-1]); r=DB.conn.execute('SELECT active FROM sponsors WHERE id=?',(sid,)).fetchone(); DB.conn.execute('UPDATE sponsors SET active=?,updated_at=? WHERE id=?',(0 if r and r[0] else 1,int(time.time()),sid));DB.conn.commit();await admin_sponsors(q)
-    elif d.startswith('admin:sponsor:delete:'):
-        DB.conn.execute('DELETE FROM sponsors WHERE id=?',(int(d.split(':')[-1]),));DB.conn.commit();await admin_sponsors(q)
-    elif d=='admin:sponsor:add':ADMIN_STATE[uid]={'type':'sponsor_add'};await q.message.reply_text('نام|URL|متن دکمه|style را با | جدا کن.',reply_markup=back('admin:sponsors'))
-    elif d=='admin:channels':await admin_channels(q)
-    elif d.startswith('admin:channel:toggle:'):
-        cid=int(d.split(':')[-1]);DB.conn.execute('UPDATE force_join_channels SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?',(cid,));DB.conn.commit();await admin_channels(q)
-    elif d.startswith('admin:channel:delete:'):
-        DB.conn.execute('DELETE FROM force_join_channels WHERE id=?',(int(d.split(':')[-1]),));DB.conn.commit();await admin_channels(q)
-    elif d=='admin:channel:add':ADMIN_STATE[uid]={'type':'channel_add'};await q.message.reply_text('chat_id|title|username|invite_url را با | جدا کن.',reply_markup=back('admin:channels'))
-    elif d=='admin:general':await admin_general(q)
-    elif d.startswith('admin:global:'):
-        k=d.split(':')[-1]; DB.set(k,'0' if DB.get(k,'1')=='1' else '1'); await admin_general(q)
-    elif d=='admin:status':
-        await q.message.edit_text(f"🛠 <b>وضعیت</b>\n\nنسخه: <code>{VERSION}</code>\nDB: <code>{esc(DB_PATH)}</code>\nPython: <code>{os.sys.version.split()[0]}</code>\nNPVT state: <b>{'آماده' if bool(os.getenv('NPVT_WHITEBOX_B64','').strip()) else 'در دسترس نیست'}</b>",parse_mode=ParseMode.HTML,reply_markup=back('admin:dashboard'))
-    elif d=='admin:health':await admin_health(q)
-    elif d.startswith('admin:test:'):await admin_test(q,d.split(':')[-1])
-    elif d=='admin:errors':await admin_errors(q)
-    elif d=='admin:jobs':await admin_jobs(q)
-    elif d=='admin:logs':await admin_logs(q)
-    elif d=='admin:database':await admin_database(q)
-    elif d=='admin:admins':await admin_admins(q)
-    elif d=='admin:admins:edit':ADMIN_STATE[uid]={'type':'admins'};await q.message.reply_text('شناسه‌های ادمین را با کاما ارسال کن.',reply_markup=back('admin:admins'))
-    elif d=='admin:reload':settings_reload();await q.message.reply_text('✅ تنظیمات reload شد.',reply_markup=admin_menu())
-    elif d=='admin:reset':
-        for k,v in {'output_uri':'1','output_json':'1','output_original':'1','duplicate_filter':'1','validation':'1','logging_level':'INFO','max_file_size':str(50*1024*1024),'max_configs':'100','process_timeout':'90','concurrency':'4'}.items():DB.set(k,v)
-        for f in FORMATS:
-            DB.set(f'format_{f}','1' if f!='npvt' or bool(os.getenv('NPVT_WHITEBOX_B64','').strip()) else '0')
-            for x in FEATURES:DB.set(f'format_{f}_{x}','1')
-        settings_reload();await q.message.reply_text('♻️ تنظیمات به حالت پایه برگشت.',reply_markup=admin_menu())
-    elif d=='admin:version':await q.message.edit_text(f"📜 <b>Version</b>\n\n<code>{VERSION}</code> — بازسازی اولیه\nBuild: {BUILD_DATE}\n\nقواعد: patch برای bugfix، minor برای feature، major برای breaking change.",parse_mode=ParseMode.HTML,reply_markup=back('admin:dashboard'))
-    elif d=='admin:database':await admin_database(q)
-    elif d=='admin:backup':await admin_backup(q)
-    elif d=='admin:cancel':ADMIN_STATE.pop(uid,None);await q.message.reply_text('❎ لغو شد.',reply_markup=admin_menu())
+async def admin_command(update, context):
+    if not admin_only(update.effective_user.id):
+        return
+    DB.upsert_user(update.effective_user)
+    await update.message.reply_text(
+        "🛡 <b>Star Decryptor Admin</b> <code>v" + APP_VERSION + "</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu(),
+    )
+
+
+async def admin_callback(update, context):
+    q = update.callback_query
+    if not admin_only(q.from_user.id):
+        await q.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await q.answer()
+
+    d = q.data
+
+    if d == "admin:dashboard":
+        await admin_dashboard(q)
+    elif d == "admin:limits":
+        await admin_limits(q)
+    elif d == "admin:broadcast":
+        ADMIN_STATE[ADMIN_ID] = {"type": "broadcast"}
+        await q.message.reply_text(
+            "📣 پیام همگانی را ارسال کن.\nبرای لغو /cancel",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❎ لغو", callback_data="admin:cancel", style="danger")]
+            ]),
+        )
+    elif d == "admin:sponsors":
+        await admin_sponsors(q)
+    elif d == "admin:sponsor:add":
+        ADMIN_STATE[ADMIN_ID] = {"type": "sponsor", "mode": "add", "step": "name", "data": {}}
+        await q.message.reply_text(
+            "🤝 <b>ساخت اسپانسر</b>\n\nمرحله 1 از 4\nنام اسپانسر را ارسال کن.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_button("admin:sponsors"),
+        )
+    elif d.startswith("admin:sponsor:edit:"):
+        sid = int(d.rsplit(":", 1)[1])
+        s = DB.sponsor(sid)
+        if not s:
+            await admin_sponsors(q)
+            return
+        ADMIN_STATE[ADMIN_ID] = {
+            "type": "sponsor", "mode": "edit", "step": "name",
+            "sponsor_id": sid,
+            "data": {
+                "name": s["name"], "url": s["url"],
+                "button_text": s["button_text"], "style": s["style"],
+            },
+        }
+        await q.message.reply_text(
+            f"✏️ <b>ویرایش #{sid}</b>\n\n"
+            "مرحله 1 از 4\nنام جدید را ارسال کن.\n"
+            "اگر می‌خواهی همان نام بماند، همان نام را ارسال کن.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_button("admin:sponsors"),
+        )
+    elif d.startswith("admin:sponsor:toggle:"):
+        sid = int(d.rsplit(":", 1)[1])
+        s = DB.sponsor(sid)
+        if s:
+            DB.set_sponsor_active(sid, not bool(s["active"]))
+        await admin_sponsors(q)
+    elif d.startswith("admin:sponsor:delete:"):
+        sid = int(d.rsplit(":", 1)[1])
+        DB.delete_sponsor(sid)
+        await admin_sponsors(q)
+    elif d == "admin:sponsor:up":
+        pass
+    elif d == "admin:status":
+        await admin_status(q)
+    elif d == "admin:jobs":
+        await admin_jobs(q)
+    elif d == "admin:settings":
+        await admin_settings(q)
+    elif d == "admin:database":
+        await admin_database(q)
+    elif d == "admin:database:backup":
+        await admin_backup(q)
+    elif d == "admin:database:replace":
+        ADMIN_STATE[ADMIN_ID] = {"type": "db_replace"}
+        await q.message.reply_text("💾 فایل دیتابیس را ارسال کن. نام و پسوند فایل مهم نیست؛ فایل باید یک SQLite database معتبر باشد.\nبرای لغو /cancel", reply_markup=back_button("admin:database"))
+    elif d == "admin:logs":
+        await admin_logs(q)
+    elif d == "admin:engine_logs":
+        await admin_engine_logs(q)
+    elif d == "admin:channels":
+        await admin_channels(q)
+    elif d == "admin:app_formats":
+        await admin_app_formats(q)
+    elif d.startswith("admin:features:"):
+        await admin_features(q, d.rsplit(":", 1)[1])
+    elif d.startswith("admin:feature:toggle:"):
+        _, _, _, ext, feature = d.split(":", 4)
+        ext = "." + ext.lower()
+        if ext in APP_FORMATS and feature in RESULT_FEATURES:
+            key = feature_setting_key(ext, feature)
+            DB.set_setting(key, "0" if feature_enabled(ext, feature) else "1")
+        await admin_features(q, ext)
+    elif d.startswith("admin:appfmt:toggle:"):
+        ext = "." + d.rsplit(":", 1)[1].lower()
+        if ext in APP_FORMATS:
+            key = APP_FORMATS[ext]["setting"]
+            DB.set_setting(key, "0" if app_format_enabled(ext) else "1")
+        await admin_app_formats(q)
+    elif d == "admin:channel:add":
+        ADMIN_STATE[ADMIN_ID] = {"type": "channel", "step": "chat", "data": {}}
+        await q.message.reply_text("🔒 مرحله 1 از 2\nشناسه کانال یا @username را ارسال کن. بات باید در آن کانال ادمین باشد.", reply_markup=back_button("admin:channels"))
+    elif d.startswith("admin:channel:toggle:"):
+        DB.toggle_channel(int(d.rsplit(":",1)[1])); await admin_channels(q)
+    elif d.startswith("admin:channel:delete:"):
+        DB.delete_channel(int(d.rsplit(":",1)[1])); await admin_channels(q)
+    elif d == "admin:captcha":
+        await admin_captcha(q)
+    elif d == "admin:captcha:custom":
+        ADMIN_STATE[ADMIN_ID] = {"type": "captcha_custom"}
+        await q.message.reply_text("✏️ تعداد عملیات را از ۱ تا ۱۰۰۰ ارسال کن.", reply_markup=back_button("admin:captcha"))
+    elif d.startswith("admin:captcha:set:"):
+        DB.set_setting("captcha_interval", d.rsplit(":",1)[1]); await admin_captcha(q)
+    elif d == "admin:cancel":
+        ADMIN_STATE.pop(ADMIN_ID, None)
+        await q.message.reply_text("❎ لغو شد.", reply_markup=admin_menu())
+    elif d.startswith("admin:limit:set:"):
+        value = d.rsplit(":", 1)[1]
+        DB.set_setting("daily_limit", value)
+        await admin_limits(q)
+    elif d == "admin:maintenance:toggle":
+        DB.set_setting("maintenance", "0" if maintenance_on() else "1")
+        await admin_limits(q)
+    elif d.startswith("admin:maxsize:"):
+        value = int(d.rsplit(":", 1)[1])
+        DB.set_setting("max_file_size", str(value))
+        await admin_settings(q)
+    elif d.startswith("admin:timeout:"):
+        value = int(d.rsplit(":", 1)[1])
+        DB.set_setting("process_timeout", str(value))
+        await admin_settings(q)
+    elif d.startswith("admin:users:"):
+        await admin_users(q, int(d.rsplit(":", 1)[1]))
+    elif d.startswith("admin:user:view:"):
+        await admin_user_view(q, int(d.rsplit(":", 1)[1]))
+    elif d.startswith("admin:user:block:"):
+        uid = int(d.rsplit(":", 1)[1])
+        if uid != ADMIN_ID:
+            DB.set_blocked(uid, True)
+        await admin_user_view(q, uid)
+    elif d.startswith("admin:user:unblock:"):
+        uid = int(d.rsplit(":", 1)[1])
+        DB.set_blocked(uid, False)
+        await admin_user_view(q, uid)
+    elif d.startswith("admin:user:jobs:"):
+        await admin_user_jobs(q, int(d.rsplit(":", 1)[1]))
+
+
+def back_button(callback):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=callback, style="primary")]])
+
+async def admin_app_formats(q):
+    lines = ["📦 <b>مدیریت فرمت و قابلیت‌ها</b>", "", "هر فرمت ورودی مستقل است و قابلیت‌های خروجی آن جداگانه کنترل می‌شوند.", ""]
+    rows=[]
+    for ext, meta in APP_FORMATS.items():
+        enabled=app_format_enabled(ext)
+        lines.append(f"{'🟢' if enabled else '⚪'} <b>{esc(meta['name'])}</b> <code>{ext}</code>")
+        rows.append([InlineKeyboardButton(f"{'🟢' if enabled else '⚪'} ورودی {meta['name']}", callback_data=f"admin:appfmt:toggle:{ext[1:]}", style="success" if enabled else "primary")])
+        rows.append([InlineKeyboardButton("🎛 قابلیت‌های این فرمت", callback_data=f"admin:features:{ext[1:]}", style="primary")])
+    rows.append([InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")])
+    await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_features(q, ext):
+    ext="."+ext.lower().lstrip(".")
+    if ext not in APP_FORMATS:
+        await admin_app_formats(q); return
+    rows=[]
+    for feature,label in RESULT_FEATURES.items():
+        on=feature_enabled(ext,feature)
+        rows.append([InlineKeyboardButton(f"{'🟢' if on else '⚪'} {label}", callback_data=f"admin:feature:toggle:{ext[1:]}:{feature}", style="success" if on else "primary")])
+    rows.append([InlineKeyboardButton("🔙 فرمت‌ها", callback_data="admin:app_formats", style="primary")])
+    summary = "\n".join(("🟢 " if feature_enabled(ext,f) else "⚪ ") + RESULT_FEATURES[f] for f in RESULT_FEATURES)
+    await q.message.edit_text(f"🎛 <b>قابلیت‌های {esc(APP_FORMATS[ext]['name'])}</b>\n\n{summary}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_database(q):
+    exists = DB_PATH.exists()
+    size = file_size_text(DB_PATH.stat().st_size) if exists else "0 KB"
+    await q.message.edit_text("💾 <b>مدیریت دیتابیس</b>\n\n" f"وضعیت: <b>{'آماده' if exists else 'یافت نشد'}</b>\nحجم: <b>{size}</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ بکاپ کامل", callback_data="admin:database:backup", style="success")],[InlineKeyboardButton("♻️ جایگزینی کامل", callback_data="admin:database:replace", style="danger")],[InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")]]))
+
+async def admin_backup(q):
+    tmp = Path(tempfile.mkstemp(prefix="pd-backup-", suffix=".db")[1])
+    try:
+        DB.snapshot(tmp)
+        with tmp.open("rb") as fh:
+            await q.message.reply_document(fh, filename="prodecryptor-backup.db", caption="💾 بکاپ کامل و یکپارچه دیتابیس")
+        await q.message.reply_text("💾 بکاپ ارسال شد.", reply_markup=back_button("admin:database"))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def admin_logs(q):
+    with LOG_LOCK:
+        cutoff = time.time() - LOG_WINDOW_SECONDS
+        while LOG_BUFFER and LOG_BUFFER[0][0] < cutoff:
+            LOG_BUFFER.popleft()
+        lines = [x[1] for x in LOG_BUFFER]
+    content = "\n".join(lines) or "در ۵ دقیقه اخیر لاگی ثبت نشده است."
+    if len(content) > 45000:
+        content = content[-45000:]
+    path = Path(tempfile.mkstemp(prefix="pd-logs-", suffix=".txt")[1])
+    try:
+        path.write_text(content, encoding="utf-8")
+        await q.message.reply_document(path.open("rb"), filename="logs-last-5-min.txt", caption="📜 فقط لاگ‌های ۵ دقیقه اخیر")
+    finally:
+        path.unlink(missing_ok=True)
+    await q.message.reply_text("📜 گزارش آماده شد.", reply_markup=back_button("admin:dashboard"))
+
+async def admin_engine_logs(q):
+    """Send the complete persisted stdout/stderr produced by the decoder engine."""
+    if not ENGINE_LOG_PATH.exists():
+        await q.message.reply_text("📜 هنوز لاگ موتور ثبت نشده است.", reply_markup=back_button("admin:dashboard"))
+        return
+    try:
+        size = ENGINE_LOG_PATH.stat().st_size
+        if size > 45 * 1024 * 1024:
+            # Keep the latest 45 MiB so Telegram can receive it reliably.
+            with ENGINE_LOG_PATH.open("rb") as fh:
+                fh.seek(max(0, size - 45 * 1024 * 1024))
+                data = fh.read()
+            tmp = Path(tempfile.mkstemp(prefix="pd-engine-logs-", suffix=".txt")[1])
+            tmp.write_bytes("[بخش انتهایی لاگ موتور]\n\n".encode("utf-8") + data)
+        else:
+            tmp = ENGINE_LOG_PATH
+        try:
+            with tmp.open("rb") as fh:
+                await q.message.reply_document(fh, filename="engine-full.log", caption="⚙️ لاگ کامل موتور: stdout + stderr")
+        finally:
+            if tmp != ENGINE_LOG_PATH:
+                tmp.unlink(missing_ok=True)
+    except Exception as exc:
+        log.exception("sending engine logs failed")
+        await q.message.reply_text(f"❌ ارسال لاگ موتور ناموفق بود: {esc(str(exc)[:500])}", parse_mode=ParseMode.HTML, reply_markup=back_button("admin:dashboard"))
+    else:
+        await q.message.reply_text("⚙️ لاگ کامل موتور ارسال شد.", reply_markup=back_button("admin:dashboard"))
+
+async def admin_captcha(q):
+    interval = int(DB.setting("captcha_interval", "10"))
+    await q.message.edit_text("🤖 <b>ضد ربات</b>\n\n" f"اولین ورود: سؤال امنیتی اجباری\nبعد از هر: <b>{interval}</b> عملیات موفق\nحداکثر تلاش: <b>5</b>\n\nعدد موردنظر را انتخاب کن:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("5", callback_data="admin:captcha:set:5", style="primary"),InlineKeyboardButton("10", callback_data="admin:captcha:set:10", style="primary"),InlineKeyboardButton("20", callback_data="admin:captcha:set:20", style="primary")],[InlineKeyboardButton("✏️ عدد دلخواه", callback_data="admin:captcha:custom", style="primary")],[InlineKeyboardButton("🔙 تنظیمات", callback_data="admin:settings", style="primary")]]))
+
+async def admin_channels(q):
+    channels = DB.channels(False)
+    lines = ["🔒 <b>عضویت اجباری</b>", ""]
+    rows = []
+    for ch in channels:
+        lines.append(f"{'🟢' if ch['active'] else '⚪'} {esc(ch['title'] or ch['username'] or ch['chat_id'])}")
+        rows.append([InlineKeyboardButton("فعال/غیرفعال", callback_data=f"admin:channel:toggle:{ch['id']}", style="success" if ch['active'] else "primary"), InlineKeyboardButton("🗑", callback_data=f"admin:channel:delete:{ch['id']}", style="danger")])
+    if not channels: lines.append("هنوز کانالی ثبت نشده است.")
+    rows += [[InlineKeyboardButton("➕ افزودن کانال", callback_data="admin:channel:add", style="success")],[InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")]]
+    await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+async def admin_dashboard(q):
+    s = DB.stats()
+    limit = int(DB.setting("daily_limit", "5"))
+    await q.message.edit_text(
+        "📊 <b>داشبورد مدیریت</b>\n\n"
+        f"👥 کاربران: <b>{s['users']}</b>\n"
+        f"🟢 فعال 24 ساعت: <b>{s['active']}</b>\n"
+        f"⛔ مسدود: <b>{s['blocked']}</b>\n\n"
+        f"📁 فایل‌ها: <b>{s['files']}</b>\n"
+        f"✅ موفق: <b>{s['success']}</b>\n"
+        f"❌ ناموفق: <b>{s['failed']}</b>\n"
+        f"🔗 لینک‌ها: <b>{s['links']}</b>\n"
+        f"⚡ عملیات 24 ساعت: <b>{s['jobs24']}</b>\n\n"
+        f"📅 سهمیه روزانه: <b>{'∞' if limit == 0 else limit}</b>\n"
+        f"🛠 تعمیر: <b>{'فعال' if maintenance_on() else 'خاموش'}</b>\n"
+        f"🕐 {now_text()}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu(),
+    )
+
+
+async def admin_limits(q):
+    limit = int(DB.setting("daily_limit", "5"))
+    maintenance = maintenance_on()
+    rows = [
+        [
+            InlineKeyboardButton("1", callback_data="admin:limit:set:1", style="primary"),
+            InlineKeyboardButton("3", callback_data="admin:limit:set:3", style="primary"),
+            InlineKeyboardButton("5", callback_data="admin:limit:set:5", style="primary"),
+            InlineKeyboardButton("10", callback_data="admin:limit:set:10", style="primary"),
+        ],
+        [
+            InlineKeyboardButton("20", callback_data="admin:limit:set:20", style="primary"),
+            InlineKeyboardButton("50", callback_data="admin:limit:set:50", style="primary"),
+            InlineKeyboardButton("∞", callback_data="admin:limit:set:0", style="success"),
+        ],
+        [
+            InlineKeyboardButton(
+                "🛠 روشن" if not maintenance else "🟢 خاموش",
+                callback_data="admin:maintenance:toggle",
+                style="danger" if not maintenance else "success",
+            )
+        ],
+        [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+    ]
+    await q.message.edit_text(
+        "⚙️ <b>سهمیه و محدودیت</b>\n\n"
+        f"سقف فعلی هر کاربر: <b>{'∞' if limit == 0 else limit}</b> فایل در روز\n"
+        f"حالت تعمیر: <b>{'فعال' if maintenance else 'خاموش'}</b>\n\n"
+        "سهمیه با زمان UTC روزانه محاسبه می‌شود.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_settings(q):
+    size = int(DB.setting("max_file_size", str(DEFAULT_MAX_FILE_SIZE)))
+    timeout = int(DB.setting("process_timeout", str(DEFAULT_PROCESS_TIMEOUT)))
+    await q.message.edit_text(
+        "⚙️ <b>تنظیمات سرویس</b>\n\n"
+        f"📦 حجم فعلی: <b>{file_size_text(size)}</b>\n"
+        f"⏱ زمان پردازش: <b>{timeout} ثانیه</b>\n"
+        f"⚡ پردازش همزمان: <b>{MAX_CONCURRENT_JOBS}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("10MB", callback_data=f"admin:maxsize:{10*1024*1024}", style="primary"),
+                InlineKeyboardButton("25MB", callback_data=f"admin:maxsize:{25*1024*1024}", style="primary"),
+                InlineKeyboardButton("50MB", callback_data=f"admin:maxsize:{50*1024*1024}", style="primary"),
+            ],
+            [
+                InlineKeyboardButton("100MB", callback_data=f"admin:maxsize:{100*1024*1024}", style="primary"),
+                InlineKeyboardButton("30s", callback_data="admin:timeout:30", style="primary"),
+                InlineKeyboardButton("60s", callback_data="admin:timeout:60", style="primary"),
+                InlineKeyboardButton("120s", callback_data="admin:timeout:120", style="primary"),
+            ],
+            [InlineKeyboardButton("🤖 ضد ربات", callback_data="admin:captcha", style="primary")],
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+        ]),
+    )
+
+
+async def admin_status(q):
+    engine = os.path.isfile(PANTEGNOS_BIN)
+    await q.message.edit_text(
+        "🛠 <b>وضعیت سرویس</b>\n\n"
+        f"🤖 Star Decryptor: <b>v{APP_VERSION}</b>\n"
+        f"⚙️ موتور پردازش: <b>{'آماده' if engine else 'یافت نشد'}</b>\n"
+        f"💾 دیتابیس: <code>{esc(DB_PATH)}</code>\n"
+        f"📦 حجم: <b>{file_size_text(int(DB.setting('max_file_size', str(DEFAULT_MAX_FILE_SIZE))) )}</b>\n"
+        f"⏱ timeout: <b>{DB.setting('process_timeout', str(DEFAULT_PROCESS_TIMEOUT))}s</b>\n"
+        f"⚡ همزمانی: <b>{MAX_CONCURRENT_JOBS}</b>\n"
+        f"🕐 {now_text()}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 بروزرسانی", callback_data="admin:status", style="success")],
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+        ]),
+    )
+
+
+async def admin_jobs(q):
+    jobs = DB.recent_jobs()
+    lines = ["🧾 <b>آخرین عملیات</b>", ""]
+    for j in jobs:
+        icon = {
+            "success": "✅", "failed": "❌",
+            "processing": "⏳", "password_required": "🔐"
+        }.get(j["status"], "•")
+        dt = datetime.fromtimestamp(j["created_at"], timezone.utc).strftime("%m-%d %H:%M")
+        lines.append(
+            f"{icon} <code>{esc(j['filename'])}</code> | "
+            f"{j['user_id']} | {j['links_count']} لینک | {dt}"
+        )
+    if len(lines) == 2:
+        lines.append("هنوز عملیاتی ثبت نشده است.")
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")]
+        ]),
+    )
+
+
+async def admin_users(q, page):
+    users = DB.users_page(page)
+    total = DB.user_count()
+    lines = [f"👥 <b>کاربران</b> — صفحه {page+1}", f"کل: <b>{total}</b>", ""]
+    rows = []
+
+    for u in users:
+        name = u["username"] or u["first_name"] or str(u["user_id"])
+        icon = "⛔" if u["is_blocked"] else "🟢"
+        lines.append(
+            f"{icon} <b>{esc(name)}</b> | <code>{u['user_id']}</code> | "
+            f"فایل {u['total_files']} | لینک {u['total_links']}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                f"👤 {u['user_id']}",
+                callback_data=f"admin:user:view:{u['user_id']}",
+                style="primary",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"admin:users:{page-1}", style="primary"))
+    if (page + 1) * 8 < total:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"admin:users:{page+1}", style="primary"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")])
+
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_user_view(q, user_id):
+    u = DB.get_user(user_id)
+    if not u:
+        await q.message.edit_text("کاربر پیدا نشد.", reply_markup=admin_menu())
+        return
+
+    name = " ".join(x for x in [u["first_name"], u["last_name"]] if x).strip()
+    username = f"@{u['username']}" if u["username"] else "ندارد"
+    limit = int(DB.setting("daily_limit", "5"))
+    used = DB.daily_usage(user_id)
+
+    await q.message.edit_text(
+        "👤 <b>جزئیات کاربر</b>\n\n"
+        f"🆔 <code>{u['user_id']}</code>\n"
+        f"👤 {esc(name or 'بدون نام')}\n"
+        f"🔹 {esc(username)}\n"
+        f"📅 امروز: <b>{used} / {'∞' if limit == 0 else limit}</b>\n\n"
+        f"📁 کل فایل‌ها: <b>{u['total_files']}</b>\n"
+        f"✅ موفق: <b>{u['successful_files']}</b>\n"
+        f"❌ ناموفق: <b>{u['failed_files']}</b>\n"
+        f"🔗 لینک‌ها: <b>{u['total_links']}</b>\n"
+        f"🔒 وضعیت: <b>{'مسدود' if u['is_blocked'] else 'فعال'}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🟢 رفع مسدودیت" if u["is_blocked"] else "⛔ مسدود",
+                    callback_data=f"admin:user:{'unblock' if u['is_blocked'] else 'block'}:{user_id}",
+                    style="success" if u["is_blocked"] else "danger",
+                ),
+                InlineKeyboardButton(
+                    "🧾 عملیات", callback_data=f"admin:user:jobs:{user_id}", style="primary"
+                ),
+            ],
+            [InlineKeyboardButton("🔙 کاربران", callback_data="admin:users:0", style="primary")],
+        ]),
+    )
+
+
+async def admin_user_jobs(q, user_id):
+    rows = DB.conn.execute(
+        "SELECT * FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+        (user_id,),
+    ).fetchall()
+    lines = [f"🧾 <b>عملیات کاربر {user_id}</b>", ""]
+    for j in rows:
+        icon = "✅" if j["status"] == "success" else "❌" if j["status"] == "failed" else "🔐"
+        lines.append(
+            f"{icon} <code>{esc(j['filename'])}</code> | "
+            f"{j['links_count']} لینک"
+        )
+    if len(lines) == 2:
+        lines.append("عملیاتی ثبت نشده است.")
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 کاربر", callback_data=f"admin:user:view:{user_id}", style="primary")]
+        ]),
+    )
+
 
 async def admin_sponsors(q):
-    rows=DB.conn.execute('SELECT * FROM sponsors ORDER BY sort_order,id').fetchall(); lines=['🤝 <b>اسپانسرها</b>','']; buttons=[]
-    for r in rows:
-        style_icon={'primary':'🔵','success':'🟢','danger':'🔴'}.get(r['style'],'🔵'); lines.append(f"{'🟢' if r['active'] else '⚪'} {style_icon} {esc(r['button_text'])} — {esc(r['style'])} #{r['id']}"); buttons.append([InlineKeyboardButton('فعال/غیرفعال',callback_data=f"admin:sponsor:toggle:{r['id']}"),InlineKeyboardButton('🗑',callback_data=f"admin:sponsor:delete:{r['id']}")])
-    buttons.append([InlineKeyboardButton('➕ افزودن',callback_data='admin:sponsor:add')]);buttons.append([InlineKeyboardButton('🔙 پنل',callback_data='admin:dashboard')]);await q.message.edit_text('\n'.join(lines),parse_mode=ParseMode.HTML,reply_markup=kb(buttons))
-async def admin_channels(q):
-    rows=DB.conn.execute('SELECT * FROM force_join_channels ORDER BY id').fetchall();lines=['🔒 <b>عضویت اجباری</b>',''];buttons=[]
-    for r in rows:
-        lines.append(f"{'🟢' if r['active'] else '⚪'} {esc(r['title'] or r['username'] or r['chat_id'])}");buttons.append([InlineKeyboardButton('فعال/غیرفعال',callback_data=f"admin:channel:toggle:{r['id']}"),InlineKeyboardButton('🗑',callback_data=f"admin:channel:delete:{r['id']}")])
-    buttons.append([InlineKeyboardButton('➕ افزودن',callback_data='admin:channel:add')]);buttons.append([InlineKeyboardButton('🔙 پنل',callback_data='admin:dashboard')]);await q.message.edit_text('\n'.join(lines),parse_mode=ParseMode.HTML,reply_markup=kb(buttons))
+    sponsors = DB.sponsors(False)
+    lines = ["🤝 <b>مدیریت اسپانسرها</b>", ""]
+    if not sponsors:
+        lines.append("هنوز اسپانسری ثبت نشده است.")
 
-async def admin_general(q):
-    keys=['output_uri','output_json','output_original','duplicate_filter','validation']; rows=[]
-    for k in keys:rows.append([InlineKeyboardButton(f"{'🟢' if DB.get(k,'1')=='1' else '⚪'} {k}",callback_data=f'admin:global:{k}')])
-    rows.append([InlineKeyboardButton('🔙 پنل',callback_data='admin:dashboard')])
-    await q.message.edit_text(f"⚙️ <b>تنظیمات عمومی</b>\n\nحجم: {int(DB.get('max_file_size',str(50*1024*1024)))//1024//1024}MB\nتعداد کانفیگ: {DB.get('max_configs','100')}\nTimeout: {DB.get('process_timeout','90')}s\nConcurrency: {DB.get('concurrency','4')}\nLog level: {esc(DB.get('logging_level','INFO'))}",parse_mode=ParseMode.HTML,reply_markup=kb(rows))
+    rows = []
+    for s in sponsors:
+        state = "🟢" if s["active"] else "⚪"
+        lines.append(
+            f"{state} <b>{esc(s['button_text'])}</b> | "
+            f"{esc(s['style'])} | #{s['id']}"
+        )
+        rows.append([
+            InlineKeyboardButton(
+                f"✏️ #{s['id']}",
+                callback_data=f"admin:sponsor:edit:{s['id']}",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                "🟢 فعال" if s["active"] else "⚪ غیرفعال",
+                callback_data=f"admin:sponsor:toggle:{s['id']}",
+                style="success" if s["active"] else "primary",
+            ),
+            InlineKeyboardButton(
+                "🗑",
+                callback_data=f"admin:sponsor:delete:{s['id']}",
+                style="danger",
+            ),
+        ])
 
-async def admin_health(q):
-    lines=['🧪 <b>سلامت parserها</b>','']
-    for f,n in FORMATS.items():
-        ready=f!='npvt' or bool(os.getenv('NPVT_WHITEBOX_B64','').strip())
-        lines.append(f"{'🟢' if ready else '🔴'} {n}: {'آماده' if ready else 'نیازمند white-box state دقیق'}")
-    rows=[[InlineKeyboardButton(f'🧪 تست {n}',callback_data=f'admin:test:{f}')] for f,n in FORMATS.items()];rows.append([InlineKeyboardButton('🔙 پنل',callback_data='admin:dashboard')])
-    await q.message.edit_text('\n'.join(lines),parse_mode=ParseMode.HTML,reply_markup=kb(rows))
+    rows.append([
+        InlineKeyboardButton("➕ ساخت اسپانسر", callback_data="admin:sponsor:add", style="success")
+    ])
+    rows.append([
+        InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")
+    ])
 
-async def admin_test(q,fmt):
-    try:
-        path=Path('tests/fixtures')
-        candidates=list(path.glob(f'{fmt}.*'))
-        if not candidates: raise RuntimeError('fixture واقعی برای این parser در پروژه موجود نیست')
-        data=candidates[0].read_bytes();r=await asyncio.to_thread(process,data,candidates[0].name,set(FORMATS),int(DB.get('max_configs','100')),True,None,True,True)
-        text=f"🧪 {FORMATS[fmt]}\n\n{'✅' if not r.errors else '❌'}\n{esc('; '.join(r.errors+r.warnings))}"
-    except Exception as e:text=f"🧪 {FORMATS.get(fmt,fmt)}\n\n⚠️ {esc(str(e))}"
-    await q.message.edit_text(text,parse_mode=ParseMode.HTML,reply_markup=back('admin:health'))
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
-async def admin_errors(q):
-    rows=DB.conn.execute("SELECT filename,status,error,created_at FROM jobs WHERE status='failed' ORDER BY created_at DESC LIMIT 20").fetchall(); lines=['📈 <b>آخرین خطاها</b>','']
-    for x in rows:lines.append(f"❌ <code>{esc(x['filename'])}</code> — {esc(x['error'][:180])}")
-    await q.message.edit_text('\n'.join(lines),parse_mode=ParseMode.HTML,reply_markup=back('admin:dashboard'))
-async def admin_jobs(q):
-    rows=DB.conn.execute("SELECT filename,status,links_count,created_at FROM jobs ORDER BY created_at DESC LIMIT 20").fetchall();lines=['🧾 <b>آخرین فعالیت‌ها</b>','']
-    for x in rows:lines.append(f"{'✅' if x['status']=='success' else '❌'} {esc(x['filename'])} | {x['links_count']}")
-    await q.message.edit_text('\n'.join(lines),parse_mode=ParseMode.HTML,reply_markup=back('admin:dashboard'))
-async def admin_logs(q):
-    await q.message.edit_text('📜 <b>لاگ اخیر</b>\n\n'+esc('\n'.join(LOG_BUFFER[-100:]) or 'لاگی ثبت نشده.'),parse_mode=ParseMode.HTML,reply_markup=back('admin:dashboard'))
-async def admin_database(q):
-    await q.message.edit_text(f"💾 <b>دیتابیس</b>\n\nمسیر: <code>{esc(DB_PATH)}</code>\nوجود دارد: {'بله' if DB_PATH.exists() else 'خیر'}",parse_mode=ParseMode.HTML,reply_markup=kb([[InlineKeyboardButton('⬇️ بکاپ',callback_data='admin:backup')],[InlineKeyboardButton('🔙 پنل',callback_data='admin:dashboard')]]))
-async def admin_backup(q):
-    tmp=Path(tempfile.mkstemp(suffix='.db')[1]);
-    try:
-        dst=__import__('sqlite3').connect(tmp);DB.conn.backup(dst);dst.close()
-        with tmp.open('rb') as f:await q.message.reply_document(f,filename='database-backup.db')
-    finally:tmp.unlink(missing_ok=True)
-async def admin_admins(q):
-    await q.message.edit_text(f"👥 <b>ادمین‌ها</b>\n\n<code>{esc(DB.get('admin_ids',str(DEFAULT_ADMIN_ID)))}</code>",parse_mode=ParseMode.HTML,reply_markup=kb([[InlineKeyboardButton('✏️ ویرایش',callback_data='admin:admins:edit')],[InlineKeyboardButton('🔙 پنل',callback_data='admin:dashboard')]]))
 
-async def admin_state_handler(update,context):
-    uid=update.effective_user.id; state=ADMIN_STATE.get(uid)
-    if not state:return False
-    raw=(update.message.text or '').strip()
-    if state.get('type')=='admins':
-        try:ids=[str(int(x.strip())) for x in raw.split(',') if x.strip()]
-        except:await update.message.reply_text('❌ شناسه نامعتبر است.');return True
-        if not ids or str(DEFAULT_ADMIN_ID) not in ids:await update.message.reply_text('❌ ادمین فعلی باید حفظ شود.');return True
-        DB.set('admin_ids',','.join(dict.fromkeys(ids)));ADMIN_STATE.pop(uid,None);await update.message.reply_text('✅ فهرست ادمین‌ها ذخیره شد.',reply_markup=admin_menu());return True
-    if state.get('type')=='sponsor_add':
-        try:name,url,button,style=[x.strip() for x in raw.split('|',3)]; style=style if style in {'primary','success','danger'} else 'primary'; now=int(time.time()); order=DB.conn.execute('SELECT COALESCE(MAX(sort_order),0)+1 FROM sponsors').fetchone()[0];DB.conn.execute('INSERT INTO sponsors(name,url,button_text,style,active,sort_order,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?)',(name,url,button,style,order,now,now));DB.conn.commit();ADMIN_STATE.pop(uid,None);await update.message.reply_text('✅ اسپانسر ثبت شد.',reply_markup=admin_menu())
-        except:await update.message.reply_text('❌ قالب صحیح: نام|URL|متن|style')
-        return True
-    if state.get('type')=='channel_add':
-        try:chat,title,user,invite=[x.strip() for x in raw.split('|',3)];DB.conn.execute('INSERT OR REPLACE INTO force_join_channels(chat_id,title,username,invite_url,active,created_at) VALUES(?,?,?,?,1,?)',(chat,title,user,invite,int(time.time())));DB.conn.commit();ADMIN_STATE.pop(uid,None);await update.message.reply_text('✅ کانال ثبت شد.',reply_markup=admin_menu())
-        except:await update.message.reply_text('❌ قالب صحیح: chat_id|title|username|invite_url')
-        return True
-    if state.get('type')=='broadcast':
-        ADMIN_STATE.pop(uid,None); ok=bad=0
-        for r in DB.conn.execute('SELECT user_id FROM users WHERE is_blocked=0').fetchall():
-            try:await context.bot.send_message(r['user_id'],raw);ok+=1
-            except (Forbidden,TelegramError):bad+=1
-            await asyncio.sleep(.03)
-        await update.message.reply_text(f'📣 پایان ارسال همگانی\nموفق: {ok}\nناموفق: {bad}',reply_markup=admin_menu());return True
-    return False
+# ============================================================
+# Admin state: broadcast + sponsor wizard
+# ============================================================
 
-async def handle_text(update,context):
-    if not await guard(update):return
-    uid=update.effective_user.id
-    if uid in CAPTCHA:await handle_captcha(update,context);return
-    if is_admin(uid) and await admin_state_handler(update,context):return
-    # Text input is intentionally not an extraction interface.
-    if not await force_join(update,context):return
-    await update.message.reply_text('📤 فقط فایل قابل پردازش است.',reply_markup=user_menu())
+async def handle_admin_state(update, context):
+    state = ADMIN_STATE.get(ADMIN_ID)
+    if not state:
+        return
 
-async def error_handler(update,context):log.exception('Unhandled exception',exc_info=context.error)
-async def post_init(app):
-    DB.open();settings_reload();log.info('started version=%s db=%s',VERSION,DB_PATH)
-async def post_shutdown(app):
-    for uid in list(JOBS):cleanup(uid)
+    if state["type"] == "db_replace":
+        doc = update.message.document
+        work = Path(tempfile.mkstemp(prefix="pd-db-", suffix=".bin")[1])
+        old_snapshot = DB_PATH.with_name("prodecryptor-before-replace.db")
+        try:
+            if not doc:
+                raise RuntimeError("فایل دیتابیس ارسال نشده است")
+            tg = await doc.get_file()
+            await tg.download_to_drive(custom_path=str(work))
+            with open(work, "rb") as f:
+                header = f.read(16)
+            if header != b"SQLite format 3\x00":
+                raise RuntimeError("فایل SQLite معتبر نیست")
+            test = sqlite3.connect(f"file:{work}?mode=ro", uri=True)
+            try:
+                ok = test.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            finally:
+                test.close()
+            if not ok:
+                raise RuntimeError("بررسی سلامت دیتابیس ناموفق بود")
+
+            # Make a consistent snapshot first; WAL pages are included.
+            DB.snapshot(old_snapshot)
+            DB.conn.close()
+            DB.conn = None
+            for suffix in ("-wal", "-shm"):
+                Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+            shutil.copy2(work, DB_PATH)
+            try:
+                DB.open()
+            except Exception:
+                # Never leave the bot without its previous working database.
+                for suffix in ("-wal", "-shm"):
+                    Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+                shutil.copy2(old_snapshot, DB_PATH)
+                DB.open()
+                raise
+            ADMIN_STATE.pop(ADMIN_ID, None)
+            log.warning("Database replaced successfully from uploaded SQLite file: %s", doc.file_name)
+            await update.message.reply_text("✅ دیتابیس با موفقیت و پس از بررسی سلامت جایگزین شد. نسخه قبلی هم برای بازیابی نگه داشته شد.", reply_markup=admin_menu())
+        except Exception as exc:
+            log.exception("database replacement failed")
+            await update.message.reply_text(f"❌ جایگزینی انجام نشد؛ دیتابیس قبلی حفظ شد.\n{esc(str(exc))}", parse_mode=ParseMode.HTML, reply_markup=back_button("admin:database"))
+        finally:
+            work.unlink(missing_ok=True)
+        return
+
+    if state["type"] == "channel":
+        if update.message.document:
+            await update.message.reply_text("❌ این مرحله متن می‌خواهد.")
+            return
+        value = (update.message.text or "").strip()
+        if state["step"] == "chat":
+            try:
+                chat = await context.bot.get_chat(value)
+            except Exception as exc:
+                await update.message.reply_text(f"❌ کانال پیدا نشد یا بات دسترسی ندارد.\n{esc(str(exc))}", parse_mode=ParseMode.HTML)
+                return
+            state["data"].update({"chat_id": chat.id, "title": chat.title or "", "username": chat.username or ""})
+            state["step"] = "invite"
+            await update.message.reply_text("مرحله 2 از 2\nلینک دعوت عمومی/خصوصی کانال را ارسال کن. برای کانال عمومی می‌توانی @username را بفرستی.")
+            return
+        if state["step"] == "invite":
+            invite = value
+            if invite.startswith("@"): invite = "https://t.me/" + invite[1:]
+            if not invite.startswith(("https://t.me/", "http://t.me/")):
+                await update.message.reply_text("❌ لینک باید از نوع t.me باشد.")
+                return
+            d = state["data"]
+            DB.add_channel(d["chat_id"], d["title"], d["username"], invite)
+            ADMIN_STATE.pop(ADMIN_ID, None)
+            await update.message.reply_text("✅ کانال ثبت شد و از این پس عضویت کاربران بررسی می‌شود.", reply_markup=admin_menu())
+            return
+
+    if state["type"] == "captcha_custom":
+        try:
+            value = int((update.message.text or "").strip())
+            if not 1 <= value <= 1000:
+                raise ValueError
+            DB.set_setting("captcha_interval", str(value))
+            ADMIN_STATE.pop(ADMIN_ID, None)
+            await update.message.reply_text(f"✅ ضد ربات روی هر {value} عملیات تنظیم شد.", reply_markup=admin_menu())
+        except Exception:
+            await update.message.reply_text("❌ عدد باید بین ۱ تا ۱۰۰۰ باشد.")
+        return
+
+    if state["type"] == "broadcast":
+        text = update.message.text or ""
+        ADMIN_STATE.pop(ADMIN_ID, None)
+
+        users = DB.conn.execute(
+            "SELECT user_id FROM users WHERE is_blocked=0"
+        ).fetchall()
+
+        sent = failed = 0
+        status = await update.message.reply_text("📣 ارسال همگانی شروع شد...")
+        for row in users:
+            try:
+                await context.bot.send_message(row["user_id"], text)
+                sent += 1
+            except (Forbidden, TelegramError):
+                failed += 1
+            await asyncio.sleep(0.03)
+
+        await status.edit_text(
+            f"📣 <b>ارسال تمام شد.</b>\n\n"
+            f"✅ موفق: <b>{sent}</b>\n"
+            f"❌ ناموفق: <b>{failed}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+        return
+
+    if state["type"] != "sponsor":
+        return
+
+    value = (update.message.text or "").strip()
+    if not value:
+        await update.message.reply_text("❌ مقدار خالی است.")
+        return
+
+    data = state["data"]
+    step = state["step"]
+
+    if step == "name":
+        data["name"] = value
+        state["step"] = "url"
+        await update.message.reply_text(
+            "مرحله 2 از 4\nلینک اسپانسر را ارسال کن."
+        )
+    elif step == "url":
+        if not value.startswith(("https://", "http://", "tg://")):
+            await update.message.reply_text("❌ لینک نامعتبر است.")
+            return
+        data["url"] = value
+        state["step"] = "button"
+        await update.message.reply_text("مرحله 3 از 4\nمتن دکمه را ارسال کن.")
+    elif step == "button":
+        if len(value) > 64:
+            await update.message.reply_text("❌ متن دکمه حداکثر 64 کاراکتر است.")
+            return
+        data["button_text"] = value
+        state["step"] = "style"
+        await update.message.reply_text(
+            "مرحله 4 از 4\nاستایل را انتخاب کن:",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔵 Primary", callback_data="sponsorstyle:primary", style="primary"),
+                    InlineKeyboardButton("🟢 Success", callback_data="sponsorstyle:success", style="success"),
+                    InlineKeyboardButton("🔴 Danger", callback_data="sponsorstyle:danger", style="danger"),
+                ],
+                [InlineKeyboardButton("❎ لغو", callback_data="admin:cancel", style="danger")],
+            ]),
+        )
+
+
+async def sponsor_style_callback(update, context):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await q.answer()
+
+    state = ADMIN_STATE.get(ADMIN_ID)
+    if not state or state.get("type") != "sponsor":
+        return
+
+    style = q.data.split(":", 1)[1]
+    data = state["data"]
+
+    if state["mode"] == "add":
+        sid = DB.add_sponsor(
+            data["name"], data["url"], data["button_text"], style, True
+        )
+        message = f"✅ اسپانسر #{sid} ساخته و فعال شد."
+    else:
+        DB.update_sponsor(
+            state["sponsor_id"],
+            data["name"], data["url"], data["button_text"], style
+        )
+        message = f"✅ اسپانسر #{state['sponsor_id']} بروزرسانی شد."
+
+    ADMIN_STATE.pop(ADMIN_ID, None)
+
+    await q.message.edit_text(
+        message,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤝 مدیریت اسپانسرها", callback_data="admin:sponsors", style="primary")],
+            [InlineKeyboardButton("🔙 پنل", callback_data="admin:dashboard", style="primary")],
+        ]),
+    )
+
+
+# ============================================================
+# Errors / lifecycle
+# ============================================================
+
+async def error_handler(update, context):
+    log.exception("Unhandled exception", exc_info=context.error)
+
+
+async def post_init(application):
+    # Persistent storage survives Railway restarts/redeploys, so truncate
+    # the engine-only log whenever a new bot process starts.
+    reset_engine_log()
+    DB.open()
+    log.info("Database: %s", DB_PATH)
+    log.info("Engine: %s", PANTEGNOS_BIN)
+
+
+async def post_shutdown(application):
+    for uid in list(USER_JOBS):
+        cleanup_job(uid)
     DB.close()
 
+
 def main():
-    if not BOT_TOKEN:raise RuntimeError('BOT_TOKEN is not set')
-    app=Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
-    app.add_handler(CommandHandler('start',start));app.add_handler(CommandHandler('help',help_cmd));app.add_handler(CommandHandler('admin',admin_command));app.add_handler(CommandHandler('cancel',cancel))
-    app.add_handler(CallbackQueryHandler(user_callback,pattern=r'^(user|access):'));app.add_handler(CallbackQueryHandler(result_callback,pattern=r'^result:'));app.add_handler(CallbackQueryHandler(admin_callback,pattern=r'^admin:'))
-    app.add_handler(MessageHandler(filters.Document.ALL,handle_document));app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text));app.add_error_handler(error_handler);app.run_polling(allowed_updates=Update.ALL_TYPES)
-if __name__=='__main__':main()
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    app.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(result_callback, pattern=r"^result:"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(sponsor_style_callback, pattern=r"^sponsorstyle:"))
+
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_error_handler(error_handler)
+
+    log.info("Starting %s v%s", APP_NAME, APP_VERSION)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
