@@ -1,1 +1,6 @@
 python-telegram-bot
+pycryptodome
+argon2-cffi
+msgpack
+aiohttp
+requests
