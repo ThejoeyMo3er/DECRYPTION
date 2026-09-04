@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATA_DIR: /app/data
+      NPVT_WHITEBOX_BLOB_FILE: /app/data/npvt_whitebox.b64
+    volumes:
+      - bot_data:/app/data
+    init: true
+
+volumes:
+  bot_data:
