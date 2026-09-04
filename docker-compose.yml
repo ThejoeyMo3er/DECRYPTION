@@ -1,0 +1,25 @@
+services:
+  star-decryptor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DECRYPTION_SCRIPTS_REPO: https://github.com/ENIGMATIC-MAN/DECRYPTION_SCRIPTS.git
+        DECRYPTION_SCRIPTS_REF: main
+
+    container_name: star-decryptor
+    restart: unless-stopped
+
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATA_DIR: /app/data
+      DECRYPTION_SCRIPTS_DIR: /opt/DECRYPTION_SCRIPTS
+      DECRYPTION_RUNNER: ${DECRYPTION_RUNNER}
+      MAX_CONCURRENT_JOBS: 2
+
+    volumes:
+      - star_decryptor_data:/app/data
+
+volumes:
+  star_decryptor_data:
+    name: star_decryptor_data
